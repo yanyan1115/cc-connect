@@ -258,6 +258,8 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	listSelectionMu   sync.Mutex
+	listSelections    map[string]*listSelectionState
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
@@ -355,6 +357,12 @@ type modelSwitchState struct {
 	result string
 }
 
+type listSelectionState struct {
+	kind      string
+	project   string
+	createdAt time.Time
+}
+
 // pendingPermission represents a permission request waiting for user response.
 type pendingPermission struct {
 	RequestID       string
@@ -420,6 +428,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		listSelections:        make(map[string]*listSelectionState),
 		platformReady:         make(map[Platform]bool),
 		startedAt:             time.Now(),
 		streamPreview:         DefaultStreamPreviewCfg(),
@@ -1913,6 +1922,11 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	if content == "" && len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
 		return
 	}
+	if len(msg.Images) == 0 && len(msg.Files) == 0 && msg.Location == nil {
+		if handled := e.handleListNumberReply(p, msg, content); handled {
+			return
+		}
+	}
 
 	// Resolve aliases on user text BEFORE merging ExtraContent, so reply
 	// quotes and platform context survive alias resolution (PR #420 fix).
@@ -2065,6 +2079,9 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		session = targetSession
 	}
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
+	if workDir := e.applySessionProjectWorkDir(agent, sessions, interactiveKey, msg.SessionKey); workDir != "" {
+		resolvedWorkspace = workDir
+	}
 	if !session.TryLock() {
 		if e.stopCurrentMessageIfRecalled(interactiveKey) {
 			if e.waitForSessionLock(session, recalledStopLockWait) {
@@ -4613,6 +4630,7 @@ var builtinCommands = []struct {
 	{[]string{"list", "sessions"}, "list"},
 	{[]string{"switch"}, "switch"},
 	{[]string{"name", "rename"}, "name"},
+	{[]string{"project", "proj"}, "project"},
 	{[]string{"current"}, "current"},
 	{[]string{"status"}, "status"},
 	{[]string{"usage", "quota"}, "usage"},
@@ -4784,6 +4802,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdSwitch(p, msg, args)
 	case "name":
 		e.cmdName(p, msg, args)
+	case "project":
+		e.cmdProject(p, msg, args)
 	case "current":
 		e.cmdCurrent(p, msg)
 	case "status":
@@ -5215,6 +5235,11 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
 			return
 		}
+		if len(args) == 0 && e.hasProjectGroups(agentSessions, sessions) {
+			e.setListSelection(msg.SessionKey, &listSelectionState{kind: "projects", createdAt: time.Now()})
+			e.reply(p, msg.ReplyCtx, e.renderProjectGroupListText(agent, sessions, agentSessions, msg.SessionKey))
+			return
+		}
 
 		total := len(agentSessions)
 		totalPages := (total + listPageSize - 1) / listPageSize
@@ -5289,6 +5314,194 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 	e.replyWithCard(p, msg.ReplyCtx, card)
 }
 
+func (e *Engine) setListSelection(sessionKey string, selection *listSelectionState) {
+	e.listSelectionMu.Lock()
+	defer e.listSelectionMu.Unlock()
+	if e.listSelections == nil {
+		e.listSelections = make(map[string]*listSelectionState)
+	}
+	e.listSelections[sessionKey] = selection
+}
+
+func (e *Engine) getListSelection(sessionKey string) *listSelectionState {
+	e.listSelectionMu.Lock()
+	defer e.listSelectionMu.Unlock()
+	selection := e.listSelections[sessionKey]
+	if selection == nil {
+		return nil
+	}
+	if time.Since(selection.createdAt) > 10*time.Minute {
+		delete(e.listSelections, sessionKey)
+		return nil
+	}
+	cp := *selection
+	return &cp
+}
+
+func (e *Engine) clearListSelection(sessionKey string) {
+	e.listSelectionMu.Lock()
+	defer e.listSelectionMu.Unlock()
+	delete(e.listSelections, sessionKey)
+}
+
+type sessionProjectGroup struct {
+	name     string
+	sessions []AgentSessionInfo
+}
+
+func projectGroupNameForSession(s AgentSessionInfo, sessions *SessionManager) string {
+	return strings.TrimSpace(sessions.SessionProjectByAgentID(s.ID))
+}
+
+func buildProjectGroups(agentSessions []AgentSessionInfo, sessions *SessionManager) (groups []sessionProjectGroup, ungrouped []AgentSessionInfo) {
+	byProject := make(map[string][]AgentSessionInfo)
+	var names []string
+	for _, s := range agentSessions {
+		project := projectGroupNameForSession(s, sessions)
+		if project == "" {
+			ungrouped = append(ungrouped, s)
+			continue
+		}
+		if _, ok := byProject[project]; !ok {
+			names = append(names, project)
+		}
+		byProject[project] = append(byProject[project], s)
+	}
+	sort.Strings(names)
+	groups = make([]sessionProjectGroup, 0, len(names))
+	for _, name := range names {
+		groups = append(groups, sessionProjectGroup{name: name, sessions: byProject[name]})
+	}
+	return groups, ungrouped
+}
+
+func sessionGlobalIndex(agentSessions []AgentSessionInfo, id string) int {
+	for i, s := range agentSessions {
+		if s.ID == id {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+func (e *Engine) hasProjectGroups(agentSessions []AgentSessionInfo, sessions *SessionManager) bool {
+	groups, _ := buildProjectGroups(agentSessions, sessions)
+	return len(groups) > 0
+}
+
+func sessionListDisplayName(s AgentSessionInfo, sessions *SessionManager, emptySummary string) string {
+	displayName := sessions.GetSessionName(s.ID)
+	if displayName != "" {
+		return "📌 " + displayName
+	}
+	displayName = strings.ReplaceAll(s.Summary, "\n", " ")
+	displayName = strings.Join(strings.Fields(displayName), " ")
+	if displayName == "" {
+		displayName = emptySummary
+	}
+	if len([]rune(displayName)) > 40 {
+		displayName = string([]rune(displayName)[:40]) + "…"
+	}
+	return displayName
+}
+
+func (e *Engine) renderProjectGroupListText(agent Agent, sessions *SessionManager, agentSessions []AgentSessionInfo, sessionKey string) string {
+	groups, ungrouped := buildProjectGroups(agentSessions, sessions)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Sessions for %s\n", agent.Name()))
+	for i, group := range groups {
+		sb.WriteString(fmt.Sprintf("%d. 📁 %s (%d sessions)\n", i+1, group.name, len(group.sessions)))
+	}
+	if len(ungrouped) > 0 {
+		sb.WriteString("\nUngrouped sessions remain available with /switch <number | id | name>:\n")
+		activeID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+		for _, s := range ungrouped {
+			marker := "◻"
+			if s.ID == activeID {
+				marker = "▶"
+			}
+			idx := sessionGlobalIndex(agentSessions, s.ID)
+			sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
+				marker, idx, sessionListDisplayName(s, sessions, "(empty)"), s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
+		}
+	}
+	sb.WriteString("\nReply with a number to expand a project.")
+	return sb.String()
+}
+
+func (e *Engine) renderProjectSessionsListText(project string, sessions *SessionManager, agentSessions []AgentSessionInfo, sessionKey string) string {
+	activeID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📁 %s\n", project))
+	for i, s := range agentSessions {
+		marker := "◻"
+		if s.ID == activeID {
+			marker = "▶"
+		}
+		sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
+			marker, i+1, sessionListDisplayName(s, sessions, "(empty)"), s.MessageCount, s.ModifiedAt.Format("01-02 15:04")))
+	}
+	sb.WriteString("\nReply with a number to switch to that session.")
+	return sb.String()
+}
+
+func (e *Engine) renderProjectGroupListCard(agent Agent, sessions *SessionManager, agentSessions []AgentSessionInfo, sessionKey string) *Card {
+	groups, ungrouped := buildProjectGroups(agentSessions, sessions)
+	cb := NewCard().Title(e.i18n.Tf(MsgCardTitleSessions, agent.Name(), len(agentSessions)), "turquoise")
+	for i, group := range groups {
+		cb.ListItemBtn(
+			fmt.Sprintf("📁 **%s** (%d sessions)", group.name, len(group.sessions)),
+			fmt.Sprintf("#%d", i+1),
+			"default",
+			fmt.Sprintf("act:/list-project %d", i+1),
+		)
+	}
+	if len(ungrouped) > 0 {
+		cb.Divider()
+		activeID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+		for _, s := range ungrouped {
+			marker := "◻"
+			if s.ID == activeID {
+				marker = "▶"
+			}
+			idx := sessionGlobalIndex(agentSessions, s.ID)
+			cb.ListItemBtn(
+				e.i18n.Tf(MsgListItem, marker, idx, sessionListDisplayName(s, sessions, e.i18n.T(MsgListEmptySummary)), s.MessageCount, s.ModifiedAt.Format("01-02 15:04")),
+				fmt.Sprintf("#%d", idx),
+				"default",
+				fmt.Sprintf("act:/switch %d", idx),
+			)
+		}
+	}
+	cb.Note("Reply with a number to expand a project.")
+	cb.Buttons(e.cardBackButton())
+	return cb.Build()
+}
+
+func (e *Engine) renderProjectSessionsListCard(project string, sessions *SessionManager, agentSessions []AgentSessionInfo, sessionKey string) *Card {
+	activeID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	cb := NewCard().Title(fmt.Sprintf("📁 %s", project), "turquoise")
+	for i, s := range agentSessions {
+		marker := "◻"
+		if s.ID == activeID {
+			marker = "▶"
+		}
+		btnType := "default"
+		if s.ID == activeID {
+			btnType = "primary"
+		}
+		cb.ListItemBtn(
+			e.i18n.Tf(MsgListItem, marker, i+1, sessionListDisplayName(s, sessions, e.i18n.T(MsgListEmptySummary)), s.MessageCount, s.ModifiedAt.Format("01-02 15:04")),
+			fmt.Sprintf("#%d", i+1),
+			btnType,
+			fmt.Sprintf("act:/switch %s", s.ID),
+		)
+	}
+	cb.Note("Reply with a number to switch to that session.")
+	cb.Buttons(e.cardBackButton())
+	return cb.Build()
+}
+
 func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	if len(args) == 0 {
 		e.reply(p, msg.ReplyCtx, "Usage: /switch <number | id_prefix | name>")
@@ -5316,9 +5529,12 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	}
 
 	slog.Info("cmdSwitch: cleaning up old session", "session_key", msg.SessionKey)
-	e.cleanupInteractiveState(interactiveKey)
+	e.switchToAgentSession(p, msg, agent, sessions, interactiveKey, *matched)
 	slog.Info("cmdSwitch: cleanup done", "session_key", msg.SessionKey)
+}
 
+func (e *Engine) switchToAgentSession(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey string, matched AgentSessionInfo) {
+	e.cleanupInteractiveState(interactiveKey)
 	session := sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
 	session.ClearHistory()
 
@@ -5332,6 +5548,101 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	}
 	e.reply(p, msg.ReplyCtx,
 		e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount))
+}
+
+func (e *Engine) handleListNumberReply(p Platform, msg *Message, content string) bool {
+	idx, err := strconv.Atoi(strings.TrimSpace(content))
+	if err != nil || idx <= 0 {
+		return false
+	}
+	selection := e.getListSelection(msg.SessionKey)
+	if selection == nil {
+		return false
+	}
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return true
+	}
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgListError), err))
+		return true
+	}
+	agentSessions = e.applySessionFilter(agentSessions, sessions)
+	groups, _ := buildProjectGroups(agentSessions, sessions)
+
+	switch selection.kind {
+	case "projects":
+		if idx > len(groups) {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Project number %d not found.", idx))
+			return true
+		}
+		group := groups[idx-1]
+		e.setListSelection(msg.SessionKey, &listSelectionState{kind: "project_sessions", project: group.name, createdAt: time.Now()})
+		e.reply(p, msg.ReplyCtx, e.renderProjectSessionsListText(group.name, sessions, group.sessions, msg.SessionKey))
+		return true
+	case "project_sessions":
+		for _, group := range groups {
+			if group.name != selection.project {
+				continue
+			}
+			if idx > len(group.sessions) {
+				e.reply(p, msg.ReplyCtx, fmt.Sprintf("Session number %d not found in `%s`.", idx, group.name))
+				return true
+			}
+			e.clearListSelection(msg.SessionKey)
+			e.switchToAgentSession(p, msg, agent, sessions, interactiveKey, group.sessions[idx-1])
+			return true
+		}
+		e.clearListSelection(msg.SessionKey)
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Project `%s` is no longer in the session list. Use /list again.", selection.project))
+		return true
+	default:
+		e.clearListSelection(msg.SessionKey)
+		return false
+	}
+}
+
+func (e *Engine) cmdProject(p Platform, msg *Message, args []string) {
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	session := sessions.GetOrCreateActive(msg.SessionKey)
+
+	if len(args) == 0 {
+		project := strings.TrimSpace(session.GetProject())
+		if project == "" {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Current session is not assigned to a project.\nWorkdir: `%s`", e.defaultProjectBaseDir(agent)))
+			return
+		}
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Current session project: `%s`\nWorkdir: `%s`", project, e.projectWorkDir(project, agent)))
+		return
+	}
+
+	project := strings.TrimSpace(strings.Join(args, " "))
+	if project == "" {
+		e.reply(p, msg.ReplyCtx, "Usage: /project <name>")
+		return
+	}
+	if strings.ContainsAny(project, `/\:*?"<>|`) {
+		e.reply(p, msg.ReplyCtx, "Project name cannot contain path separators or reserved filename characters.")
+		return
+	}
+
+	workDir := e.projectWorkDir(project, agent)
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to create project directory `%s`: %v", workDir, err))
+		return
+	}
+	if err := sessions.SetSessionProject(session.ID, project); err != nil {
+		e.reply(p, msg.ReplyCtx, err.Error())
+		return
+	}
+	e.applySessionProjectWorkDir(agent, sessions, interactiveKey, msg.SessionKey)
+	e.reply(p, msg.ReplyCtx, fmt.Sprintf("Current session joined project `%s`.\nWorkdir: `%s`", project, workDir))
 }
 
 // matchSession resolves a user query to an agent session. Priority:
@@ -5383,6 +5694,65 @@ func (e *Engine) matchSession(sessions []AgentSessionInfo, manager *SessionManag
 	}
 
 	return nil
+}
+
+func (e *Engine) defaultProjectBaseDir(agent Agent) string {
+	baseDir := strings.TrimSpace(e.baseWorkDir)
+	if baseDir == "" {
+		if wd, ok := agent.(interface{ GetWorkDir() string }); ok {
+			baseDir = strings.TrimSpace(wd.GetWorkDir())
+		}
+	}
+	if baseDir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			baseDir = cwd
+		}
+	}
+	if abs, err := filepath.Abs(baseDir); err == nil {
+		baseDir = abs
+	}
+	return normalizeWorkspacePath(baseDir)
+}
+
+func (e *Engine) projectWorkDir(project string, agent Agent) string {
+	return normalizeWorkspacePath(filepath.Join(e.defaultProjectBaseDir(agent), project))
+}
+
+func (e *Engine) applySessionProjectWorkDir(agent Agent, sessions *SessionManager, interactiveKey, sessionKey string) string {
+	if e.multiWorkspace {
+		return ""
+	}
+	switcher, ok := agent.(WorkDirSwitcher)
+	if !ok {
+		return ""
+	}
+	session := sessions.GetOrCreateActive(sessionKey)
+	project := strings.TrimSpace(session.GetProject())
+	if project == "" {
+		return ""
+	}
+	workDir := e.projectWorkDir(project, agent)
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		slog.Warn("project workdir: mkdir failed", "project", project, "workdir", workDir, "error", err)
+		return ""
+	}
+	currentDir := strings.TrimSpace(switcher.GetWorkDir())
+	if currentDir != "" && normalizeWorkspacePath(currentDir) == workDir {
+		return workDir
+	}
+	switcher.SetWorkDir(workDir)
+	if e.projectState != nil {
+		e.projectState.SetWorkDirOverride(workDir)
+		e.projectState.Save()
+	}
+	if e.dirHistory != nil {
+		e.dirHistory.Add(e.name, workDir)
+	}
+	e.cleanupInteractiveState(interactiveKey)
+	session.SetAgentSessionID("", "")
+	session.ClearHistory()
+	sessions.Save()
+	return workDir
 }
 
 func (e *Engine) commandWorkDir(agent Agent, msg *Message) string {
@@ -9276,6 +9646,9 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 	if prefix == "act" && cmd == "/model" {
 		return e.handleModelCardAction(args, sessionKey)
 	}
+	if prefix == "act" && cmd == "/list-project" {
+		return e.handleListProjectCardAction(args, sessionKey)
+	}
 
 	if prefix == "act" {
 		e.executeCardAction(cmd, args, sessionKey)
@@ -9355,6 +9728,26 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 		return e.renderUpgradeCard()
 	}
 	return nil
+}
+
+func (e *Engine) handleListProjectCardAction(args, sessionKey string) *Card {
+	idx, err := strconv.Atoi(strings.TrimSpace(args))
+	if err != nil || idx <= 0 {
+		return e.renderListCardSafe(sessionKey, 1)
+	}
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		return e.simpleCard(e.i18n.T(MsgCardTitleSessions), "red", fmt.Sprintf(e.i18n.T(MsgListError), err))
+	}
+	agentSessions = e.applySessionFilter(agentSessions, sessions)
+	groups, _ := buildProjectGroups(agentSessions, sessions)
+	if idx > len(groups) {
+		return e.renderListCardSafe(sessionKey, 1)
+	}
+	group := groups[idx-1]
+	e.setListSelection(sessionKey, &listSelectionState{kind: "project_sessions", project: group.name, createdAt: time.Now()})
+	return e.renderProjectSessionsListCard(group.name, sessions, group.sessions, sessionKey)
 }
 
 func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
@@ -10316,6 +10709,10 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	agentSessions = e.applySessionFilter(agentSessions, sessions)
 	if len(agentSessions) == 0 {
 		return e.simpleCard(e.i18n.Tf(MsgCardTitleSessions, agent.Name(), 0), "turquoise", e.i18n.T(MsgListEmpty)), nil
+	}
+	if page == 1 && e.hasProjectGroups(agentSessions, sessions) {
+		e.setListSelection(sessionKey, &listSelectionState{kind: "projects", createdAt: time.Now()})
+		return e.renderProjectGroupListCard(agent, sessions, agentSessions, sessionKey), nil
 	}
 
 	total := len(agentSessions)

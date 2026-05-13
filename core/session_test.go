@@ -187,12 +187,31 @@ func TestSessionManager_SessionNames(t *testing.T) {
 	}
 }
 
+func TestSessionManager_SessionProject(t *testing.T) {
+	sm := NewSessionManager("")
+	s := sm.NewSession("user1", "work")
+	s.SetAgentSessionID("agent-123", "codex")
+
+	if err := sm.SetSessionProject(s.ID, "cc-connect修复"); err != nil {
+		t.Fatalf("SetSessionProject: %v", err)
+	}
+	if got := s.GetProject(); got != "cc-connect修复" {
+		t.Fatalf("session project = %q, want cc-connect修复", got)
+	}
+	if got := sm.SessionProjectByAgentID("agent-123"); got != "cc-connect修复" {
+		t.Fatalf("SessionProjectByAgentID = %q, want cc-connect修复", got)
+	}
+}
+
 func TestSessionManager_Persistence(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sessions.json")
 
 	sm1 := NewSessionManager(path)
-	sm1.NewSession("user1", "persisted")
+	s := sm1.NewSession("user1", "persisted")
+	if err := sm1.SetSessionProject(s.ID, "resume-system"); err != nil {
+		t.Fatalf("SetSessionProject: %v", err)
+	}
 	sm1.SetSessionName("agent-x", "custom-name")
 
 	sm2 := NewSessionManager(path)
@@ -202,6 +221,9 @@ func TestSessionManager_Persistence(t *testing.T) {
 	}
 	if list[0].Name != "persisted" {
 		t.Errorf("session name = %q, want persisted", list[0].Name)
+	}
+	if got := list[0].GetProject(); got != "resume-system" {
+		t.Errorf("session project after reload = %q, want resume-system", got)
 	}
 	if got := sm2.GetSessionName("agent-x"); got != "custom-name" {
 		t.Errorf("session name after reload = %q, want custom-name", got)

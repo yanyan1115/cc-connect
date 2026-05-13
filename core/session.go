@@ -18,6 +18,7 @@ const ContinueSession = "__continue__"
 type Session struct {
 	ID                  string         `json:"id"`
 	Name                string         `json:"name"`
+	Project             string         `json:"project,omitempty"`
 	AgentSessionID      string         `json:"agent_session_id"`
 	AgentType           string         `json:"agent_type,omitempty"`
 	PastAgentSessionIDs []string       `json:"past_agent_session_ids,omitempty"`
@@ -116,6 +117,21 @@ func (s *Session) GetName() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.Name
+}
+
+// GetProject atomically reads the session project group.
+func (s *Session) GetProject() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Project
+}
+
+// SetProject atomically sets the session project group.
+func (s *Session) SetProject(project string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Project = project
+	s.UpdatedAt = time.Now()
 }
 
 func (s *Session) GetUpdatedAt() time.Time {
@@ -430,6 +446,47 @@ func (sm *SessionManager) ActiveSessionID(userKey string) string {
 	return sm.activeSession[userKey]
 }
 
+// SetSessionProject assigns a project group to a session and persists it.
+func (sm *SessionManager) SetSessionProject(sessionID, project string) error {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	s := sm.sessions[sessionID]
+	if s == nil {
+		return fmt.Errorf("session %q not found", sessionID)
+	}
+	s.SetProject(project)
+	sm.saveLocked()
+	return nil
+}
+
+// SessionProjectByAgentID returns the project group for an agent session ID.
+func (sm *SessionManager) SessionProjectByAgentID(agentSessionID string) string {
+	if agentSessionID == "" {
+		return ""
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, s := range sm.sessions {
+		if s == nil {
+			continue
+		}
+		s.mu.Lock()
+		current := s.AgentSessionID
+		past := append([]string(nil), s.PastAgentSessionIDs...)
+		project := s.Project
+		s.mu.Unlock()
+		if current == agentSessionID {
+			return project
+		}
+		for _, pastID := range past {
+			if pastID == agentSessionID {
+				return project
+			}
+		}
+	}
+	return ""
+}
+
 // SetSessionName sets a custom display name for an agent session.
 func (sm *SessionManager) SetSessionName(agentSessionID, name string) {
 	sm.mu.Lock()
@@ -627,6 +684,7 @@ func (sm *SessionManager) saveLocked() {
 		snapSessions[id] = &Session{
 			ID:                  s.ID,
 			Name:                s.Name,
+			Project:             s.Project,
 			AgentSessionID:      agentSID,
 			AgentType:           s.AgentType,
 			PastAgentSessionIDs: append([]string(nil), s.PastAgentSessionIDs...),

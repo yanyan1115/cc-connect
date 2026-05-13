@@ -2482,6 +2482,100 @@ func TestCmdList_MultiWorkspaceUsesWorkspaceSessions(t *testing.T) {
 	}
 }
 
+func TestCmdProject_AssignsProjectAndWorkDir(t *testing.T) {
+	baseDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: baseDir}
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBaseWorkDir(baseDir)
+	userKey := "test:user1"
+	msg := &Message{SessionKey: userKey, ReplyCtx: "ctx"}
+
+	e.cmdProject(p, msg, []string{"cc-connect修复"})
+
+	wantDir := normalizeWorkspacePath(filepath.Join(baseDir, "cc-connect修复"))
+	if got := e.sessions.GetOrCreateActive(userKey).GetProject(); got != "cc-connect修复" {
+		t.Fatalf("project = %q, want cc-connect修复", got)
+	}
+	if got := normalizeWorkspacePath(agent.GetWorkDir()); got != wantDir {
+		t.Fatalf("workdir = %q, want %q", got, wantDir)
+	}
+	if _, err := os.Stat(wantDir); err != nil {
+		t.Fatalf("project dir was not created: %v", err)
+	}
+}
+
+func TestCmdProject_CurrentShowsUngroupedSession(t *testing.T) {
+	baseDir := t.TempDir()
+	agent := &stubWorkDirAgent{workDir: baseDir}
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	e.SetBaseWorkDir(baseDir)
+	msg := &Message{SessionKey: "test:user1", ReplyCtx: "ctx"}
+
+	e.cmdProject(p, msg, nil)
+
+	if len(p.sent) != 1 {
+		t.Fatalf("expected 1 reply, got %d", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "not assigned") {
+		t.Fatalf("expected unassigned project message, got %q", p.sent[0])
+	}
+}
+
+func TestCmdList_ProjectGroupsAndNumberSelection(t *testing.T) {
+	base := time.Date(2026, 5, 12, 10, 0, 0, 0, time.UTC)
+	agent := &stubListAgent{sessions: []AgentSessionInfo{
+		{ID: "a1", Summary: "Fix one", MessageCount: 1, ModifiedAt: base},
+		{ID: "a2", Summary: "Fix two", MessageCount: 2, ModifiedAt: base.Add(time.Minute)},
+		{ID: "b1", Summary: "Resume one", MessageCount: 3, ModifiedAt: base.Add(2 * time.Minute)},
+	}}
+	p := &stubPlatformEngine{n: "plain"}
+	e := NewEngine("test", agent, []Platform{p}, "", LangEnglish)
+	userKey := "test:user1"
+	msg := &Message{SessionKey: userKey, ReplyCtx: "ctx", Content: "/list"}
+
+	s1 := e.sessions.GetOrCreateActive(userKey)
+	s1.SetAgentSessionID("a1", "stub")
+	if err := e.sessions.SetSessionProject(s1.ID, "cc-connect修复"); err != nil {
+		t.Fatal(err)
+	}
+	s2 := e.sessions.NewSession(userKey, "two")
+	s2.SetAgentSessionID("a2", "stub")
+	if err := e.sessions.SetSessionProject(s2.ID, "cc-connect修复"); err != nil {
+		t.Fatal(err)
+	}
+	s3 := e.sessions.NewSession(userKey, "three")
+	s3.SetAgentSessionID("b1", "stub")
+	if err := e.sessions.SetSessionProject(s3.ID, "简历系统"); err != nil {
+		t.Fatal(err)
+	}
+
+	e.cmdList(p, msg, nil)
+	if len(p.sent) != 1 {
+		t.Fatalf("expected grouped /list reply, got %d", len(p.sent))
+	}
+	if !strings.Contains(p.sent[0], "📁 cc-connect修复 (2 sessions)") || !strings.Contains(p.sent[0], "📁 简历系统 (1 sessions)") {
+		t.Fatalf("grouped list missing project rows:\n%s", p.sent[0])
+	}
+
+	p.sent = nil
+	if !e.handleListNumberReply(p, &Message{SessionKey: userKey, ReplyCtx: "ctx"}, "1") {
+		t.Fatal("expected first number reply to expand project")
+	}
+	if len(p.sent) != 1 || !strings.Contains(p.sent[0], "Fix one") || !strings.Contains(p.sent[0], "Fix two") {
+		t.Fatalf("expected expanded project sessions, got %#v", p.sent)
+	}
+
+	p.sent = nil
+	if !e.handleListNumberReply(p, &Message{SessionKey: userKey, ReplyCtx: "ctx"}, "2") {
+		t.Fatal("expected second number reply to switch session")
+	}
+	if got := e.sessions.GetOrCreateActive(userKey).GetAgentSessionID(); got != "a2" {
+		t.Fatalf("active agent session = %q, want a2", got)
+	}
+}
+
 func TestHandlePendingPermission_MultiWorkspaceLookup(t *testing.T) {
 	e := newTestEngine()
 
