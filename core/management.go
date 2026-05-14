@@ -1052,7 +1052,6 @@ func (m *ManagementServer) handleProjectSessions(w http.ResponseWriter, r *http.
 			info := map[string]any{
 				"id":            s.ID,
 				"name":          displayName,
-				"project":       s.Project,
 				"session_key":   idToKey[s.ID],
 				"agent_type":    s.AgentType,
 				"active":        activeIDs[s.ID],
@@ -1155,7 +1154,6 @@ func (m *ManagementServer) handleProjectSessionDetail(w http.ResponseWriter, r *
 		data := map[string]any{
 			"id":               s.ID,
 			"name":             displayName,
-			"project":          s.Project,
 			"session_key":      sessionKey,
 			"agent_session_id": s.AgentSessionID,
 			"agent_type":       s.AgentType,
