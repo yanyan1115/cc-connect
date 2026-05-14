@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -112,6 +114,8 @@ type Platform struct {
 	shareSessionInChannel bool
 	enableReactions       bool
 	httpClient            *http.Client
+	stickerCacheDir       string
+	stickerCacheMu        sync.Mutex
 
 	mu                  sync.RWMutex
 	bot                 telegramBot
@@ -185,7 +189,16 @@ func New(opts map[string]any) (core.Platform, error) {
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	enableReactions, _ := opts["enable_reactions"].(bool)
-	return &Platform{token: token, allowFrom: allowFrom, groupReplyAll: groupReplyAll, shareSessionInChannel: shareSessionInChannel, enableReactions: enableReactions, httpClient: httpClient}, nil
+	dataDir, _ := opts["cc_data_dir"].(string)
+	return &Platform{
+		token:                 token,
+		allowFrom:             allowFrom,
+		groupReplyAll:         groupReplyAll,
+		shareSessionInChannel: shareSessionInChannel,
+		enableReactions:       enableReactions,
+		httpClient:            httpClient,
+		stickerCacheDir:       telegramStickerCacheDir(dataDir),
+	}, nil
 }
 
 func (p *Platform) Name() string { return "telegram" }
@@ -423,6 +436,24 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 			MessageID:  strconv.Itoa(msg.ID),
 			ChannelKey: channelKey,
 			Images:     []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
+			ReplyCtx:   rctx,
+		}, msg)
+		return
+	}
+
+	if msg.Sticker != nil {
+		content := formatStickerContent(msg.Sticker)
+		images, err := p.stickerThumbnailImages(msg.Sticker)
+		if err != nil {
+			slog.Warn("telegram: sticker thumbnail unavailable", "error", err, "file_unique_id", msg.Sticker.FileUniqueID)
+		}
+		p.dispatchMessage(&core.Message{
+			SessionKey: sessionKey, Platform: "telegram",
+			UserID: userID, UserName: userName, ChatName: chatName,
+			Content:    content,
+			MessageID:  strconv.Itoa(msg.ID),
+			ChannelKey: channelKey,
+			Images:     images,
 			ReplyCtx:   rctx,
 		}, msg)
 		return
@@ -1422,6 +1453,139 @@ func (p *Platform) downloadFile(fileID string) ([]byte, error) {
 		return nil, fmt.Errorf("download file %s: status %d", fileID, resp.StatusCode)
 	}
 	return io.ReadAll(resp.Body)
+}
+
+func (p *Platform) stickerThumbnailImages(sticker *models.Sticker) ([]core.ImageAttachment, error) {
+	if sticker == nil || sticker.Thumbnail == nil || sticker.Thumbnail.FileID == "" {
+		return nil, nil
+	}
+	data, err := p.downloadStickerThumbnail(sticker)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	return []core.ImageAttachment{{
+		MimeType: "image/jpeg",
+		Data:     data,
+		FileName: "telegram-sticker-" + safeTelegramCacheKey(stickerCacheKey(sticker)) + ".jpg",
+	}}, nil
+}
+
+func (p *Platform) downloadStickerThumbnail(sticker *models.Sticker) ([]byte, error) {
+	key := stickerCacheKey(sticker)
+	if key == "" {
+		return p.downloadFile(sticker.Thumbnail.FileID)
+	}
+	cachePath := p.stickerThumbnailCachePath(key)
+	if cachePath == "" {
+		return p.downloadFile(sticker.Thumbnail.FileID)
+	}
+
+	p.stickerCacheMu.Lock()
+	defer p.stickerCacheMu.Unlock()
+
+	if data, err := os.ReadFile(cachePath); err == nil && len(data) > 0 {
+		return data, nil
+	}
+
+	data, err := p.downloadFile(sticker.Thumbnail.FileID)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		slog.Warn("telegram: cache sticker thumbnail mkdir failed", "error", err, "path", filepath.Dir(cachePath))
+		return data, nil
+	}
+	if err := os.WriteFile(cachePath, data, 0o644); err != nil {
+		slog.Warn("telegram: cache sticker thumbnail write failed", "error", err, "path", cachePath)
+		return data, nil
+	}
+	return data, nil
+}
+
+func (p *Platform) stickerThumbnailCachePath(key string) string {
+	dir := p.stickerCacheDir
+	if dir == "" {
+		dir = telegramStickerCacheDir("")
+	}
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, safeTelegramCacheKey(key)+".jpg")
+}
+
+func stickerCacheKey(sticker *models.Sticker) string {
+	if sticker == nil {
+		return ""
+	}
+	if sticker.FileUniqueID != "" {
+		return sticker.FileUniqueID
+	}
+	if sticker.Thumbnail != nil {
+		return sticker.Thumbnail.FileUniqueID
+	}
+	return ""
+}
+
+func telegramStickerCacheDir(dataDir string) string {
+	if strings.TrimSpace(dataDir) == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dataDir = filepath.Join(home, ".cc-connect")
+		}
+	}
+	if strings.TrimSpace(dataDir) == "" {
+		return ""
+	}
+	return filepath.Join(dataDir, "telegram", "stickers")
+}
+
+func safeTelegramCacheKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	b.Grow(len(key))
+	for _, r := range key {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	if b.Len() == 0 {
+		return "unknown"
+	}
+	return b.String()
+}
+
+func formatStickerContent(sticker *models.Sticker) string {
+	if sticker == nil {
+		return "[sticker]"
+	}
+	var parts []string
+	if emoji := strings.TrimSpace(sticker.Emoji); emoji != "" {
+		parts = append(parts, emoji)
+	}
+	id := sticker.FileUniqueID
+	if id == "" {
+		id = sticker.FileID
+	}
+	if id != "" {
+		parts = append(parts, "[sticker: "+id+"]")
+	} else {
+		parts = append(parts, "[sticker]")
+	}
+	return strings.Join(parts, " ")
 }
 
 func (p *Platform) ReconstructReplyCtx(sessionKey string) (any, error) {

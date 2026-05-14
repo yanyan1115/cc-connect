@@ -1057,6 +1057,118 @@ func TestHandleMessageSinglePhotoDispatchesImmediately(t *testing.T) {
 	}
 }
 
+func TestHandleMessageStickerDispatchesEmojiAndThumbnail(t *testing.T) {
+	handled := make(chan *core.Message, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "thumb:%s", strings.TrimPrefix(r.URL.Path, "/"))
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		token:           "token",
+		httpClient:      server.Client(),
+		groupReplyAll:   true,
+		stickerCacheDir: t.TempDir(),
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	msg := &models.Message{
+		ID:   22,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Sticker: &models.Sticker{
+			FileID:       "sticker-file",
+			FileUniqueID: "sticker-unique",
+			Emoji:        "\U0001f642",
+			Thumbnail:    &models.PhotoSize{FileID: "thumb-file", FileUniqueID: "thumb-unique"},
+		},
+	}
+
+	p.handleMessage(context.Background(), msg)
+	p.handleMessage(context.Background(), msg)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case got := <-handled:
+			if got.Content != "\U0001f642 [sticker: sticker-unique]" {
+				t.Fatalf("Content = %q, want emoji and sticker id", got.Content)
+			}
+			if len(got.Images) != 1 {
+				t.Fatalf("Images len = %d, want 1", len(got.Images))
+			}
+			if string(got.Images[0].Data) != "thumb:thumb-file" {
+				t.Fatalf("image data = %q, want downloaded thumbnail", got.Images[0].Data)
+			}
+			if got.Images[0].MimeType != "image/jpeg" {
+				t.Fatalf("image mime = %q, want image/jpeg", got.Images[0].MimeType)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("sticker message not handled")
+		}
+	}
+
+	stubBot.mu.Lock()
+	getFileCalls := stubBot.getFileCalls
+	stubBot.mu.Unlock()
+	if getFileCalls != 1 {
+		t.Fatalf("GetFile calls = %d, want 1 cache miss followed by cache hit", getFileCalls)
+	}
+}
+
+func TestHandleMessageStickerThumbnailFailureDispatchesText(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		token:           "token",
+		httpClient:      server.Client(),
+		groupReplyAll:   true,
+		stickerCacheDir: t.TempDir(),
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   23,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Sticker: &models.Sticker{
+			FileID:       "sticker-file",
+			FileUniqueID: "sticker-unique",
+			Emoji:        "\U0001f642",
+			Thumbnail:    &models.PhotoSize{FileID: "missing-thumb", FileUniqueID: "thumb-unique"},
+		},
+	})
+
+	select {
+	case got := <-handled:
+		if got.Content != "\U0001f642 [sticker: sticker-unique]" {
+			t.Fatalf("Content = %q, want emoji and sticker id", got.Content)
+		}
+		if len(got.Images) != 0 {
+			t.Fatalf("Images len = %d, want 0 after thumbnail failure", len(got.Images))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sticker message not handled")
+	}
+}
+
 func TestHandleMessageMediaGroupsDoNotMix(t *testing.T) {
 	handled := make(chan *core.Message, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
