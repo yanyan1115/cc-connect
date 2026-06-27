@@ -1,0 +1,57 @@
+data_dir = "/var/lib/cc-connect-opencode"
+language = "zh"
+attachment_send = "on"
+
+[log]
+level = "info"
+
+[display]
+mode = "compact"
+thinking_messages = false
+tool_messages = false
+
+[stream_preview]
+enabled = false
+interval_ms = 1500
+min_delta_chars = 30
+max_chars = 2000
+
+[instant_reply]
+enabled = false
+content = "Assistant is thinking..."
+
+[rate_limit]
+max_messages = 20
+window_secs = 60
+
+[outgoing_rate_limit.platforms.telegram]
+max_per_second = 20
+burst = 3
+
+[[projects]]
+name = "Assistant"
+reset_on_idle_mins = 0
+show_context_indicator = false
+reply_footer = false
+
+[projects.agent]
+type = "opencode"
+
+[projects.agent.options]
+cmd = "/root/.opencode/bin/opencode"
+work_dir = "/opt/cc-connect-opencode/workspace/Assistant"
+model = "${OPENCODE_MODEL}"
+mode = "default"
+
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+token = "${TELEGRAM_BOT_TOKEN}"
+allow_from = "${TELEGRAM_ALLOW_FROM}"
+allow_chat = "${TELEGRAM_ALLOW_CHAT}"
+group_reply_all = false
+share_session_in_channel = true
+enable_reactions = true
+reaction_emoji = "auto"
+wake_words = "Assistant,助手"

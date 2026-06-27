@@ -600,10 +600,11 @@ func (a *Agent) providerEnvLocked() []string {
 
 // opencodeSessionEntry represents a session from `opencode session list` output.
 type opencodeSessionEntry struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Updated int64  `json:"updated"` // Unix timestamp in milliseconds
-	Created int64  `json:"created"`
+	ID        string `json:"id"`
+	Title     string `json:"title"`
+	Updated   int64  `json:"updated"` // Unix timestamp in milliseconds
+	Created   int64  `json:"created"`
+	Directory string `json:"directory"`
 }
 
 func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) {
@@ -624,6 +625,9 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 
 	var sessions []core.AgentSessionInfo
 	for _, e := range entries {
+		if !opencodeSessionMatchesWorkDir(e.Directory, workDir) {
+			continue
+		}
 		sessions = append(sessions, core.AgentSessionInfo{
 			ID:           e.ID,
 			Summary:      e.Title,
@@ -633,6 +637,32 @@ func listOpencodeSessions(cmd, workDir string) ([]core.AgentSessionInfo, error) 
 	}
 
 	return sessions, nil
+}
+
+func opencodeSessionMatchesWorkDir(sessionDir, workDir string) bool {
+	sessionDir = strings.TrimSpace(sessionDir)
+	if sessionDir == "" || strings.TrimSpace(workDir) == "" {
+		return true
+	}
+	return samePath(sessionDir, workDir)
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil {
+		a = absA
+	}
+	if errB == nil {
+		b = absB
+	}
+	if cleanA, err := filepath.EvalSymlinks(a); err == nil {
+		a = cleanA
+	}
+	if cleanB, err := filepath.EvalSymlinks(b); err == nil {
+		b = cleanB
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
 }
 
 // querySessionMessageCounts uses the sqlite3 CLI to read message counts from

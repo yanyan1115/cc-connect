@@ -258,6 +258,8 @@ type Engine struct {
 	// Interactive agent session management
 	interactiveMu     sync.Mutex
 	interactiveStates map[string]*interactiveState // key = sessionKey
+	listSelectionMu   sync.Mutex
+	listSelections    map[string]*listSelectionState // key = sessionKey
 
 	platformLifecycleMu sync.Mutex
 	platformReady       map[Platform]bool
@@ -291,6 +293,7 @@ type queuedMessage struct {
 	fromVoice     bool
 	userID        string
 	userName      string // sender's display name for sender injection
+	chatName      string // chat/group display name for sender injection guards
 	msgPlatform   string // platform name for sender injection
 	msgSessionKey string // session key for extracting chat ID
 	channelKey    string // platform-provided channel identifier (preferred over sessionKey extraction)
@@ -329,6 +332,19 @@ type interactiveState struct {
 	// the next turn (e.g. after an abnormal exit). Defaults to true (safe);
 	// cleared to false only after a clean EventResult.
 	eventsNeedResync bool
+}
+
+type listSelectionMode string
+
+const (
+	listSelectionGroups  listSelectionMode = "groups"
+	listSelectionProject listSelectionMode = "project"
+)
+
+type listSelectionState struct {
+	mode      listSelectionMode
+	project   string
+	createdAt time.Time
 }
 
 type pendingProviderAddState struct {
@@ -420,6 +436,7 @@ func NewEngine(name string, ag Agent, platforms []Platform, sessionStorePath str
 		skills:                NewSkillRegistry(),
 		aliases:               make(map[string]string),
 		interactiveStates:     make(map[string]*interactiveState),
+		listSelections:        make(map[string]*listSelectionState),
 		platformReady:         make(map[Platform]bool),
 		startedAt:             time.Now(),
 		streamPreview:         DefaultStreamPreviewCfg(),
@@ -2003,6 +2020,10 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		return
 	}
 
+	if e.handleListSelectionInput(p, msg, content) {
+		return
+	}
+
 	// "!" prefix: treat as shell command (same as /shell)
 	// Placed after permission handling so "!yes" doesn't hijack permission responses.
 	if len(msg.Images) == 0 && strings.HasPrefix(content, "!") {
@@ -2050,6 +2071,20 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	}
 
 	session := sessions.GetOrCreateActive(msg.SessionKey)
+	if msg.TargetSessionID != "" {
+		targetSession, err := sessions.ResolveSessionForRouting(msg.SessionKey, msg.TargetSessionID)
+		if err != nil {
+			slog.Warn("target session routing failed",
+				"platform", msg.Platform,
+				"session_key", msg.SessionKey,
+				"target_session_id", msg.TargetSessionID,
+				"error", err,
+			)
+			e.reply(p, msg.ReplyCtx, err.Error())
+			return
+		}
+		session = targetSession
+	}
 	sessions.UpdateUserMeta(msg.SessionKey, msg.UserName, msg.ChatName)
 	if !session.TryLock() {
 		if e.stopCurrentMessageIfRecalled(interactiveKey) {
@@ -2171,7 +2206,9 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 	if len(state.pendingMessages) >= e.maxQueuedMessages {
 		depth := len(state.pendingMessages)
 		state.mu.Unlock()
-		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
+		if !msg.SuppressQueueAck {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgQueueFull), depth))
+		}
 		return true // handled: queue-full reply sent
 	}
 	state.pendingMessages = append(state.pendingMessages, queuedMessage{
@@ -2184,6 +2221,7 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		fromVoice:     msg.FromVoice,
 		userID:        msg.UserID,
 		userName:      msg.UserName,
+		chatName:      msg.ChatName,
 		msgPlatform:   msg.Platform,
 		msgSessionKey: msg.SessionKey,
 		channelKey:    msg.ChannelKey,
@@ -2196,7 +2234,9 @@ func (e *Engine) queueMessageForBusySession(p Platform, msg *Message, interactiv
 		"user", msg.UserName,
 		"queue_depth", queueDepth,
 	)
-	e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	if !msg.SuppressQueueAck {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgMessageQueued))
+	}
 	return true
 }
 
@@ -2610,7 +2650,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		drainEvents(state.agentSession.Events())
 	}
 
-	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.Platform, msg.SessionKey, msg.ChannelKey)
+	promptContent := e.buildSenderPrompt(msg.Content, msg.UserID, msg.UserName, msg.ChatName, msg.Platform, msg.SessionKey, msg.ChannelKey)
 
 	sendStart := time.Now()
 	state.mu.Lock()
@@ -3087,7 +3127,6 @@ func buildCardContent(thinking string, tools []cardToolEntry, answer string) str
 	return sb.String()
 }
 
-
 // unsolicitedReaderStopTimeout bounds how long stopUnsolicitedReader waits
 // for the reader goroutine to exit. The reader is structured so its iterations
 // are short (blocking adapter calls like RespondPermission are offloaded), so
@@ -3430,8 +3469,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	// Streaming card: aggregate entire turn into a single updatable card.
 	var streamCard StreamingCard
-	var cardToolCalls []cardToolEntry // track tool calls for card content
-	var cardThinkingText string       // latest thinking text
+	var cardToolCalls []cardToolEntry  // track tool calls for card content
+	var cardThinkingText string        // latest thinking text
 	var cardAnswerText strings.Builder // accumulated answer text
 
 	if scp, ok := state.platform.(StreamingCardPlatform); ok {
@@ -4281,7 +4320,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 
-				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+				queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.chatName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
 				nextSend := make(chan error, 1)
 				go func() {
@@ -4559,7 +4598,7 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 		state.mu.Unlock()
 
 		e.i18n.DetectAndSet(queued.content)
-		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
+		prompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.chatName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
 		if state.agentSession == nil || !state.agentSession.Alive() {
 			e.send(queued.platform, queued.replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session ended"))
@@ -4600,6 +4639,7 @@ var builtinCommands = []struct {
 	{[]string{"list", "sessions"}, "list"},
 	{[]string{"switch"}, "switch"},
 	{[]string{"name", "rename"}, "name"},
+	{[]string{"project", "proj"}, "project"},
 	{[]string{"current"}, "current"},
 	{[]string{"status"}, "status"},
 	{[]string{"usage", "quota"}, "usage"},
@@ -4771,6 +4811,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdSwitch(p, msg, args)
 	case "name":
 		e.cmdName(p, msg, args)
+	case "project":
+		e.cmdProject(p, msg, args)
 	case "current":
 		e.cmdCurrent(p, msg)
 	case "status":
@@ -5184,6 +5226,355 @@ const listPageSize = 20
 // dirCardPageSize is the max directory history rows per card page (Feishu / other card UIs).
 const dirCardPageSize = 20
 
+const listSelectionTTL = 10 * time.Minute
+
+type listSessionEntry struct {
+	Info           AgentSessionInfo
+	DisplayName    string
+	Project        string
+	ProjectWorkDir string
+}
+
+type listProjectGroup struct {
+	Name    string
+	WorkDir string
+	Entries []listSessionEntry
+}
+
+type listGroupedView struct {
+	Entries       []listSessionEntry
+	Projects      []listProjectGroup
+	Ungrouped     []listSessionEntry
+	ProjectByName map[string]listProjectGroup
+}
+
+func (e *Engine) cmdProject(p Platform, msg *Message, args []string) {
+	agent, sessions, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
+	}
+	active := sessions.GetOrCreateActive(msg.SessionKey)
+	if len(args) == 0 {
+		project, workDir := sessions.SessionProject(active.ID)
+		if project == "" {
+			base := e.projectBaseWorkDir(agent, msg)
+			e.reply(p, msg.ReplyCtx, e.projectUnassignedText(base))
+			return
+		}
+		e.reply(p, msg.ReplyCtx, e.projectCurrentText(project, workDir))
+		return
+	}
+
+	project := strings.TrimSpace(strings.Join(args, " "))
+	dirName := safeProjectDirName(project)
+	if project == "" || dirName == "" {
+		e.reply(p, msg.ReplyCtx, e.projectUsageText())
+		return
+	}
+	base := e.projectBaseWorkDir(agent, msg)
+	workDir := filepath.Join(base, dirName)
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		e.reply(p, msg.ReplyCtx, e.projectCreateDirErrorText(err))
+		return
+	}
+	sessions.SetActiveSessionProject(msg.SessionKey, project, workDir)
+	e.clearListSelection(msg.SessionKey)
+	e.reply(p, msg.ReplyCtx, e.projectSetText(project, workDir))
+}
+
+func (e *Engine) projectUsageText() string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese, LangTraditionalChinese:
+		return "用法：/project <项目名>"
+	case LangJapanese:
+		return "使い方: /project <プロジェクト名>"
+	case LangSpanish:
+		return "Uso: /project <proyecto>"
+	default:
+		return "Usage: /project <name>"
+	}
+}
+
+func (e *Engine) projectUnassignedText(base string) string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return fmt.Sprintf("当前会话尚未归属项目。\n工作目录：`%s`", base)
+	case LangTraditionalChinese:
+		return fmt.Sprintf("目前會話尚未歸屬專案。\n工作目錄：`%s`", base)
+	case LangJapanese:
+		return fmt.Sprintf("現在のセッションはプロジェクト未所属です。\n作業ディレクトリ: `%s`", base)
+	case LangSpanish:
+		return fmt.Sprintf("La sesión actual no pertenece a ningún proyecto.\nDirectorio de trabajo: `%s`", base)
+	default:
+		return fmt.Sprintf("Current session is not assigned to a project.\nWorkdir: `%s`", base)
+	}
+}
+
+func (e *Engine) projectCurrentText(project, workDir string) string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return fmt.Sprintf("当前项目：**%s**\n工作目录：`%s`", project, workDir)
+	case LangTraditionalChinese:
+		return fmt.Sprintf("目前專案：**%s**\n工作目錄：`%s`", project, workDir)
+	case LangJapanese:
+		return fmt.Sprintf("現在のプロジェクト: **%s**\n作業ディレクトリ: `%s`", project, workDir)
+	case LangSpanish:
+		return fmt.Sprintf("Proyecto actual: **%s**\nDirectorio de trabajo: `%s`", project, workDir)
+	default:
+		return fmt.Sprintf("Current project: **%s**\nWorkdir: `%s`", project, workDir)
+	}
+}
+
+func (e *Engine) projectCreateDirErrorText(err error) string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return fmt.Sprintf("创建项目目录失败：%v", err)
+	case LangTraditionalChinese:
+		return fmt.Sprintf("建立專案目錄失敗：%v", err)
+	case LangJapanese:
+		return fmt.Sprintf("プロジェクトディレクトリを作成できませんでした: %v", err)
+	case LangSpanish:
+		return fmt.Sprintf("No se pudo crear el directorio del proyecto: %v", err)
+	default:
+		return fmt.Sprintf("Failed to create project directory: %v", err)
+	}
+}
+
+func (e *Engine) projectSetText(project, workDir string) string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return fmt.Sprintf("已加入项目：**%s**\n目录：`%s`\n未改变 Codex native session 的 cwd，/list 会继续显示原有会话。", project, workDir)
+	case LangTraditionalChinese:
+		return fmt.Sprintf("已加入專案：**%s**\n目錄：`%s`\n未改變 Codex native session 的 cwd，/list 會繼續顯示原有會話。", project, workDir)
+	case LangJapanese:
+		return fmt.Sprintf("プロジェクトを設定しました: **%s**\nディレクトリ: `%s`\nCodex native session の cwd は変更していないため、/list は既存セッションを引き続き表示します。", project, workDir)
+	case LangSpanish:
+		return fmt.Sprintf("Proyecto asignado: **%s**\nDirectorio: `%s`\nNo se cambió el cwd nativo de Codex; /list seguirá mostrando las sesiones existentes.", project, workDir)
+	default:
+		return fmt.Sprintf("Project set: **%s**\nDirectory: `%s`\nNative session cwd was not changed; /list will keep the existing Codex sessions visible.", project, workDir)
+	}
+}
+
+func (e *Engine) projectBaseWorkDir(agent Agent, msg *Message) string {
+	if dir := strings.TrimSpace(e.baseWorkDir); dir != "" {
+		return absOrOriginal(dir)
+	}
+	if dir := strings.TrimSpace(e.commandWorkDir(agent, msg)); dir != "" {
+		return absOrOriginal(dir)
+	}
+	wd, _ := os.Getwd()
+	return absOrOriginal(wd)
+}
+
+func absOrOriginal(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return dir
+	}
+	return abs
+}
+
+func safeProjectDirName(name string) string {
+	name = strings.TrimSpace(name)
+	var b strings.Builder
+	for _, r := range name {
+		if r < 32 {
+			continue
+		}
+		switch r {
+		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.Trim(strings.TrimSpace(b.String()), ".")
+}
+
+func (e *Engine) buildListGroupedView(sessions *SessionManager, sessionKey string, agentSessions []AgentSessionInfo) listGroupedView {
+	view := listGroupedView{ProjectByName: make(map[string]listProjectGroup)}
+	projectOrder := make([]string, 0)
+	for _, s := range agentSessions {
+		displayName := sessions.GetSessionName(s.ID)
+		if displayName != "" {
+			displayName = "📌 " + displayName
+		} else {
+			displayName = compactSessionDisplayName(s.Summary)
+			if displayName == "" {
+				displayName = e.i18n.T(MsgListEmptySummary)
+			}
+			if len([]rune(displayName)) > 40 {
+				displayName = string([]rune(displayName)[:40]) + "…"
+			}
+		}
+		project, workDir := sessions.AgentSessionProject(sessionKey, s.ID)
+		entry := listSessionEntry{
+			Info:           s,
+			DisplayName:    displayName,
+			Project:        project,
+			ProjectWorkDir: workDir,
+		}
+		view.Entries = append(view.Entries, entry)
+		if project == "" {
+			view.Ungrouped = append(view.Ungrouped, entry)
+			continue
+		}
+		group, ok := view.ProjectByName[project]
+		if !ok {
+			projectOrder = append(projectOrder, project)
+			group = listProjectGroup{Name: project, WorkDir: workDir}
+		}
+		if group.WorkDir == "" {
+			group.WorkDir = workDir
+		}
+		group.Entries = append(group.Entries, entry)
+		view.ProjectByName[project] = group
+	}
+	for _, name := range projectOrder {
+		view.Projects = append(view.Projects, view.ProjectByName[name])
+	}
+	return view
+}
+
+func (v listGroupedView) HasProjects() bool {
+	return len(v.Projects) > 0
+}
+
+func (e *Engine) setListSelection(sessionKey string, state *listSelectionState) {
+	e.listSelectionMu.Lock()
+	defer e.listSelectionMu.Unlock()
+	if state == nil {
+		delete(e.listSelections, sessionKey)
+		return
+	}
+	state.createdAt = time.Now()
+	e.listSelections[sessionKey] = state
+}
+
+func (e *Engine) clearListSelection(sessionKey string) {
+	e.setListSelection(sessionKey, nil)
+}
+
+func (e *Engine) getListSelection(sessionKey string) *listSelectionState {
+	e.listSelectionMu.Lock()
+	defer e.listSelectionMu.Unlock()
+	state := e.listSelections[sessionKey]
+	if state == nil {
+		return nil
+	}
+	if time.Since(state.createdAt) > listSelectionTTL {
+		delete(e.listSelections, sessionKey)
+		return nil
+	}
+	cp := *state
+	return &cp
+}
+
+func (e *Engine) groupedListTopRows(view listGroupedView) []any {
+	rows := make([]any, 0, len(view.Projects)+len(view.Ungrouped))
+	for _, group := range view.Projects {
+		rows = append(rows, group)
+	}
+	for _, entry := range view.Ungrouped {
+		rows = append(rows, entry)
+	}
+	return rows
+}
+
+func (e *Engine) renderGroupedListText(agent Agent, sessions *SessionManager, sessionKey string, view listGroupedView) string {
+	activeAgentID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	rows := e.groupedListTopRows(view)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Sessions (%s, %d)\n", agent.Name(), len(view.Entries)))
+	for i, row := range rows {
+		switch v := row.(type) {
+		case listProjectGroup:
+			marker := "◻"
+			for _, entry := range v.Entries {
+				if entry.Info.ID == activeAgentID {
+					marker = "▶"
+					break
+				}
+			}
+			sb.WriteString(fmt.Sprintf("%s **%d.** 📁 %s (%d sessions)\n", marker, i+1, v.Name, len(v.Entries)))
+		case listSessionEntry:
+			marker := "◻"
+			if v.Info.ID == activeAgentID {
+				marker = "▶"
+			}
+			sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
+				marker, i+1, v.DisplayName, v.Info.MessageCount, v.Info.ModifiedAt.Format("01-02 15:04")))
+		}
+	}
+	sb.WriteString("\n" + e.listGroupHintText())
+	return sb.String()
+}
+
+func (e *Engine) renderProjectListText(sessions *SessionManager, sessionKey string, group listProjectGroup) string {
+	activeAgentID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📁 **%s** (%d sessions)\n", group.Name, len(group.Entries)))
+	if group.WorkDir != "" {
+		sb.WriteString(fmt.Sprintf("Workdir: `%s`\n", group.WorkDir))
+	}
+	for i, entry := range group.Entries {
+		marker := "◻"
+		if entry.Info.ID == activeAgentID {
+			marker = "▶"
+		}
+		sb.WriteString(fmt.Sprintf("%s **%d.** %s · **%d** msgs · %s\n",
+			marker, i+1, entry.DisplayName, entry.Info.MessageCount, entry.Info.ModifiedAt.Format("01-02 15:04")))
+	}
+	sb.WriteString("\n" + e.listProjectHintText())
+	return sb.String()
+}
+
+func (e *Engine) listGroupHintText() string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return "回复项目序号可展开项目；回复未分组会话序号可直接切换。"
+	case LangTraditionalChinese:
+		return "回覆專案序號可展開專案；回覆未分組會話序號可直接切換。"
+	case LangJapanese:
+		return "プロジェクト番号で展開、未分類セッション番号で直接切り替えできます。"
+	case LangSpanish:
+		return "Responde con el número de un proyecto para expandirlo, o con el de una sesión sin grupo para cambiar."
+	default:
+		return "Reply with a project number to expand it, or an ungrouped session number to switch."
+	}
+}
+
+func (e *Engine) listProjectHintText() string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return "回复会话序号可切换到该会话。"
+	case LangTraditionalChinese:
+		return "回覆會話序號可切換到該會話。"
+	case LangJapanese:
+		return "セッション番号でそのセッションに切り替えます。"
+	case LangSpanish:
+		return "Responde con el número de sesión para cambiar a ella."
+	default:
+		return "Reply with a session number to switch."
+	}
+}
+
+func (e *Engine) listProjectRowSwitchText(index int) string {
+	switch e.i18n.CurrentLang() {
+	case LangChinese:
+		return fmt.Sprintf("第 %d 项是项目分组。请直接回复 `%d` 展开项目，再选择里面的会话。", index, index)
+	case LangTraditionalChinese:
+		return fmt.Sprintf("第 %d 項是專案分組。請直接回覆 `%d` 展開專案，再選擇裡面的會話。", index, index)
+	case LangJapanese:
+		return fmt.Sprintf("%d 番はプロジェクトグループです。`%d` と返信して展開し、その中のセッションを選んでください。", index, index)
+	case LangSpanish:
+		return fmt.Sprintf("El elemento %d es un grupo de proyecto. Responde `%d` para expandirlo y luego elige una sesión.", index, index)
+	default:
+		return fmt.Sprintf("Item %d is a project group. Reply with `%d` to expand it, then choose a session inside.", index, index)
+	}
+}
+
 func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 	agent, sessions, _, err := e.commandContext(p, msg)
 	if err != nil {
@@ -5200,6 +5591,12 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		agentSessions = e.applySessionFilter(agentSessions, sessions)
 		if len(agentSessions) == 0 {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
+			return
+		}
+		view := e.buildListGroupedView(sessions, msg.SessionKey, agentSessions)
+		if view.HasProjects() {
+			e.setListSelection(msg.SessionKey, &listSelectionState{mode: listSelectionGroups})
+			e.reply(p, msg.ReplyCtx, e.renderGroupedListText(agent, sessions, msg.SessionKey, view))
 			return
 		}
 
@@ -5258,6 +5655,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 			sb.WriteString(fmt.Sprintf(e.i18n.T(MsgListPageHint), page, totalPages))
 		}
 		sb.WriteString(e.i18n.T(MsgListSwitchHint))
+		e.clearListSelection(msg.SessionKey)
 		e.reply(p, msg.ReplyCtx, sb.String())
 		return
 	}
@@ -5273,6 +5671,7 @@ func (e *Engine) cmdList(p Platform, msg *Message, args []string) {
 		e.reply(p, msg.ReplyCtx, err.Error())
 		return
 	}
+	e.setListSelection(msg.SessionKey, &listSelectionState{mode: listSelectionGroups})
 	e.replyWithCard(p, msg.ReplyCtx, card)
 }
 
@@ -5296,6 +5695,17 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	}
 	agentSessions = e.applySessionFilter(agentSessions, sessions)
 
+	if matched, replyText, handled := e.matchSessionFromListSelection(msg.SessionKey, query, sessions, agentSessions); handled {
+		if matched == nil {
+			if replyText != "" {
+				e.reply(p, msg.ReplyCtx, replyText)
+			}
+			return
+		}
+		e.switchToListEntry(p, msg, agent, sessions, interactiveKey, listSessionEntry{Info: *matched})
+		return
+	}
+
 	matched := e.matchSession(agentSessions, sessions, query)
 	if matched == nil {
 		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoMatch), query))
@@ -5308,6 +5718,7 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 
 	session := sessions.SwitchToAgentSession(msg.SessionKey, matched.ID, agent.Name(), matched.Summary)
 	session.ClearHistory()
+	e.clearListSelection(msg.SessionKey)
 
 	shortID := matched.ID
 	if len(shortID) > 12 {
@@ -5319,6 +5730,118 @@ func (e *Engine) cmdSwitch(p Platform, msg *Message, args []string) {
 	}
 	e.reply(p, msg.ReplyCtx,
 		e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, matched.MessageCount))
+}
+
+func (e *Engine) matchSessionFromListSelection(sessionKey, query string, sessions *SessionManager, agentSessions []AgentSessionInfo) (*AgentSessionInfo, string, bool) {
+	idx, err := strconv.Atoi(strings.TrimSpace(query))
+	if err != nil || idx < 1 {
+		return nil, "", false
+	}
+	state := e.getListSelection(sessionKey)
+	view := e.buildListGroupedView(sessions, sessionKey, agentSessions)
+	if len(view.Entries) == 0 {
+		return nil, "", false
+	}
+	if state != nil && state.mode == listSelectionProject {
+		group, ok := view.ProjectByName[state.project]
+		if !ok || idx > len(group.Entries) {
+			return nil, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx), true
+		}
+		matched := group.Entries[idx-1].Info
+		return &matched, "", true
+	}
+	if view.HasProjects() {
+		rows := e.groupedListTopRows(view)
+		if idx > len(rows) {
+			return nil, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx), true
+		}
+		switch row := rows[idx-1].(type) {
+		case listProjectGroup:
+			return nil, e.listProjectRowSwitchText(idx), true
+		case listSessionEntry:
+			matched := row.Info
+			return &matched, "", true
+		default:
+			return nil, "", false
+		}
+	}
+	return nil, "", false
+}
+
+func (e *Engine) handleListSelectionInput(p Platform, msg *Message, content string) bool {
+	if len(msg.Images) > 0 || len(msg.Files) > 0 || msg.Location != nil {
+		return false
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(content))
+	if err != nil || idx < 1 {
+		return false
+	}
+	state := e.getListSelection(msg.SessionKey)
+	if state == nil {
+		return false
+	}
+	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return true
+	}
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgError, err))
+		return true
+	}
+	agentSessions = e.applySessionFilter(agentSessions, sessions)
+	view := e.buildListGroupedView(sessions, msg.SessionKey, agentSessions)
+	if len(view.Entries) == 0 {
+		e.reply(p, msg.ReplyCtx, e.i18n.T(MsgListEmpty))
+		return true
+	}
+
+	switch state.mode {
+	case listSelectionProject:
+		group, ok := view.ProjectByName[state.project]
+		if !ok || idx > len(group.Entries) {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx))
+			return true
+		}
+		e.switchToListEntry(p, msg, agent, sessions, interactiveKey, group.Entries[idx-1])
+		return true
+	default:
+		rows := e.groupedListTopRows(view)
+		if idx > len(rows) {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgSwitchNoSession), idx))
+			return true
+		}
+		switch row := rows[idx-1].(type) {
+		case listProjectGroup:
+			e.setListSelection(msg.SessionKey, &listSelectionState{mode: listSelectionProject, project: row.Name})
+			e.reply(p, msg.ReplyCtx, e.renderProjectListText(sessions, msg.SessionKey, row))
+			return true
+		case listSessionEntry:
+			e.switchToListEntry(p, msg, agent, sessions, interactiveKey, row)
+			return true
+		default:
+			return false
+		}
+	}
+}
+
+func (e *Engine) switchToListEntry(p Platform, msg *Message, agent Agent, sessions *SessionManager, interactiveKey string, entry listSessionEntry) {
+	e.cleanupInteractiveState(interactiveKey)
+	session := sessions.SwitchToAgentSession(msg.SessionKey, entry.Info.ID, agent.Name(), entry.Info.Summary)
+	session.ClearHistory()
+	e.clearListSelection(msg.SessionKey)
+
+	shortID := entry.Info.ID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	displayName := sessions.GetSessionName(entry.Info.ID)
+	if displayName == "" {
+		displayName = entry.Info.Summary
+	}
+	e.reply(p, msg.ReplyCtx,
+		e.i18n.Tf(MsgSwitchSuccess, displayName, shortID, entry.Info.MessageCount))
 }
 
 // matchSession resolves a user query to an agent session. Priority:
@@ -7495,7 +8018,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 		if !supportsCards(p) {
 			fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
 			defer cancel()
-			models := switcher.AvailableModels(fetchCtx)
+			models := modelOptionsForCurrentProvider(switcher, switcher.AvailableModels(fetchCtx))
 
 			var sb strings.Builder
 			current := switcher.GetModel()
@@ -7561,7 +8084,7 @@ func (e *Engine) cmdModel(p Platform, msg *Message, args []string) {
 	if modelSwitchNeedsLookup(target) {
 		fetchCtx, cancel := context.WithTimeout(e.ctx, 10*time.Second)
 		defer cancel()
-		models := switcher.AvailableModels(fetchCtx)
+		models := modelOptionsForCurrentProvider(switcher, switcher.AvailableModels(fetchCtx))
 		target = resolveModelSwitchTarget(target, models)
 	}
 
@@ -7606,6 +8129,51 @@ func resolveModelSwitchTarget(input string, models []ModelOption) string {
 		}
 	}
 	return input
+}
+
+func modelOptionsForCurrentProvider(switcher ModelSwitcher, models []ModelOption) []ModelOption {
+	if len(models) == 0 {
+		return models
+	}
+	if providerSwitcher, ok := switcher.(ProviderSwitcher); ok {
+		if active := providerSwitcher.GetActiveProvider(); active != nil {
+			if len(active.Models) > 0 {
+				return active.Models
+			}
+			if filtered := filterModelOptionsByProvider(models, active.Name); len(filtered) > 0 {
+				return filtered
+			}
+		}
+	}
+	if provider := modelProviderName(switcher.GetModel()); provider != "" {
+		if filtered := filterModelOptionsByProvider(models, provider); len(filtered) > 0 {
+			return filtered
+		}
+	}
+	return models
+}
+
+func filterModelOptionsByProvider(models []ModelOption, provider string) []ModelOption {
+	provider = strings.TrimSpace(provider)
+	if provider == "" {
+		return nil
+	}
+	prefix := provider + "/"
+	filtered := make([]ModelOption, 0, len(models))
+	for _, m := range models {
+		if strings.HasPrefix(m.Name, prefix) {
+			filtered = append(filtered, m)
+		}
+	}
+	return filtered
+}
+
+func modelProviderName(model string) string {
+	provider, _, ok := strings.Cut(strings.TrimSpace(model), "/")
+	if !ok {
+		return ""
+	}
+	return provider
 }
 
 func modelSwitchNeedsLookup(input string) bool {
@@ -9289,6 +9857,12 @@ func (e *Engine) handleCardNav(action string, sessionKey string) *Card {
 			}
 		}
 		return e.renderListCardSafe(sessionKey, page)
+	case "/list-project":
+		project := strings.TrimSpace(args)
+		if project == "" {
+			return e.renderListCardSafe(sessionKey, 1)
+		}
+		return e.renderProjectListCard(sessionKey, project)
 	case "/dir":
 		page := 1
 		if args != "" {
@@ -9358,7 +9932,7 @@ func (e *Engine) handleModelCardAction(args, sessionKey string) *Card {
 	target = strings.TrimSpace(target)
 	if modelSwitchNeedsLookup(target) {
 		fetchCtx, cancel := context.WithTimeout(e.ctx, 3*time.Second)
-		models := switcher.AvailableModels(fetchCtx)
+		models := modelOptionsForCurrentProvider(switcher, switcher.AvailableModels(fetchCtx))
 		target = resolveModelSwitchTarget(target, models)
 		cancel()
 	}
@@ -9393,7 +9967,7 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		}
 		target = strings.TrimSpace(target)
 		if modelSwitchNeedsLookup(target) {
-			models := switcher.AvailableModels(fetchCtx)
+			models := modelOptionsForCurrentProvider(switcher, switcher.AvailableModels(fetchCtx))
 			target = resolveModelSwitchTarget(target, models)
 		}
 		cancel()
@@ -10159,7 +10733,7 @@ func (e *Engine) renderModelCard(sessionKey string) *Card {
 
 	fetchCtx, cancel := context.WithTimeout(e.ctx, 3*time.Second)
 	defer cancel()
-	models := switcher.AvailableModels(fetchCtx)
+	models := modelOptionsForCurrentProvider(switcher, switcher.AvailableModels(fetchCtx))
 	current := switcher.GetModel()
 
 	var sb strings.Builder
@@ -10304,6 +10878,10 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	if len(agentSessions) == 0 {
 		return e.simpleCard(e.i18n.Tf(MsgCardTitleSessions, agent.Name(), 0), "turquoise", e.i18n.T(MsgListEmpty)), nil
 	}
+	view := e.buildListGroupedView(sessions, sessionKey, agentSessions)
+	if view.HasProjects() {
+		return e.renderGroupedListCard(agent, sessions, sessionKey, view, page), nil
+	}
 
 	total := len(agentSessions)
 	totalPages := (total + listPageSize - 1) / listPageSize
@@ -10375,6 +10953,114 @@ func (e *Engine) renderListCard(sessionKey string, page int) (*Card, error) {
 	}
 
 	return cb.Build(), nil
+}
+
+func (e *Engine) renderGroupedListCard(agent Agent, sessions *SessionManager, sessionKey string, view listGroupedView, page int) *Card {
+	rows := e.groupedListTopRows(view)
+	total := len(rows)
+	totalPages := (total + listPageSize - 1) / listPageSize
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	if page < 1 {
+		page = 1
+	}
+	if page > totalPages {
+		page = totalPages
+	}
+	start := (page - 1) * listPageSize
+	end := start + listPageSize
+	if end > total {
+		end = total
+	}
+
+	title := fmt.Sprintf("Sessions (%s, %d)", agent.Name(), len(view.Entries))
+	if totalPages > 1 {
+		title = fmt.Sprintf("Sessions (%s, %d) · %d/%d", agent.Name(), len(view.Entries), page, totalPages)
+	}
+	activeAgentID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	cb := NewCard().Title(title, "turquoise")
+	for i := start; i < end; i++ {
+		rowNumber := i + 1
+		switch row := rows[i].(type) {
+		case listProjectGroup:
+			marker := "◻"
+			for _, entry := range row.Entries {
+				if entry.Info.ID == activeAgentID {
+					marker = "▶"
+					break
+				}
+			}
+			cb.ListItemBtn(
+				fmt.Sprintf("%s **%d.** 📁 %s (%d sessions)", marker, rowNumber, row.Name, len(row.Entries)),
+				fmt.Sprintf("#%d", rowNumber),
+				"default",
+				"nav:/list-project "+row.Name,
+			)
+		case listSessionEntry:
+			marker := "◻"
+			btnType := "default"
+			if row.Info.ID == activeAgentID {
+				marker = "▶"
+				btnType = "primary"
+			}
+			cb.ListItemBtn(
+				e.i18n.Tf(MsgListItem, marker, rowNumber, row.DisplayName, row.Info.MessageCount, row.Info.ModifiedAt.Format("01-02 15:04")),
+				fmt.Sprintf("#%d", rowNumber),
+				btnType,
+				fmt.Sprintf("act:/switch %d", rowNumber),
+			)
+		}
+	}
+
+	var navBtns []CardButton
+	if page > 1 {
+		navBtns = append(navBtns, e.cardPrevButton(fmt.Sprintf("nav:/list %d", page-1)))
+	}
+	navBtns = append(navBtns, e.cardBackButton())
+	if page < totalPages {
+		navBtns = append(navBtns, e.cardNextButton(fmt.Sprintf("nav:/list %d", page+1)))
+	}
+	cb.Buttons(navBtns...)
+	cb.Note(e.listGroupHintText())
+	return cb.Build()
+}
+
+func (e *Engine) renderProjectListCard(sessionKey, project string) *Card {
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	agentSessions, err := agent.ListSessions(e.ctx)
+	if err != nil {
+		return e.simpleCard("Project sessions", "red", err.Error())
+	}
+	agentSessions = e.applySessionFilter(agentSessions, sessions)
+	view := e.buildListGroupedView(sessions, sessionKey, agentSessions)
+	group, ok := view.ProjectByName[project]
+	if !ok {
+		return e.simpleCard("Project sessions", "red", "Project has no visible sessions.")
+	}
+	activeAgentID := sessions.GetOrCreateActive(sessionKey).GetAgentSessionID()
+	cb := NewCard().Title(fmt.Sprintf("📁 %s (%d sessions)", group.Name, len(group.Entries)), "turquoise")
+	if group.WorkDir != "" {
+		cb.Markdown(fmt.Sprintf("Workdir: `%s`", group.WorkDir))
+	}
+	for i, entry := range group.Entries {
+		marker := "◻"
+		btnType := "default"
+		if entry.Info.ID == activeAgentID {
+			marker = "▶"
+			btnType = "primary"
+		}
+		cb.ListItemBtn(
+			e.i18n.Tf(MsgListItem, marker, i+1, entry.DisplayName, entry.Info.MessageCount, entry.Info.ModifiedAt.Format("01-02 15:04")),
+			fmt.Sprintf("#%d", i+1),
+			btnType,
+			fmt.Sprintf("act:/switch %d", i+1),
+		)
+	}
+	cb.Buttons(DefaultBtn(e.i18n.T(MsgCardBack), "nav:/list 1"))
+	cb.Note(e.listProjectHintText())
+	e.setListSelection(sessionKey, &listSelectionState{mode: listSelectionProject, project: group.Name})
+	return cb.Build()
 }
 
 // dirCardTruncPath shortens absolute paths for card list rows.
@@ -13036,7 +13722,7 @@ func (e *Engine) cmdBindSetup(p Platform, msg *Message) {
 // injectSender is enabled and userID is non-empty. When userName is available
 // it is included as sender_name so the agent can identify who sent the message
 // by display name (useful in shared channel sessions with multiple users).
-func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionKey, channelKey string) string {
+func (e *Engine) buildSenderPrompt(content, userID, userName, chatName, platform, sessionKey, channelKey string) string {
 	if !e.injectSender || userID == "" {
 		return content
 	}
@@ -13044,11 +13730,15 @@ func (e *Engine) buildSenderPrompt(content, userID, userName, platform, sessionK
 	if chatID == "" {
 		chatID = extractChannelID(sessionKey)
 	}
+	guard := ""
+	if strings.EqualFold(platform, "telegram") && strings.TrimSpace(chatName) != "" {
+		guard = "\n[cc-connect group_identity_guard: this message is from the Telegram group member above, not automatically from the primary user. Do not use owner-only pet names unless the sender identity is known.]"
+	}
 	if userName != "" {
 		safeName := strings.NewReplacer(`"`, `'`, "\n", " ", "\r", "").Replace(userName)
-		return fmt.Sprintf("[cc-connect sender_id=%s sender_name=\"%s\" platform=%s chat_id=%s]\n%s", userID, safeName, platform, chatID, content)
+		return fmt.Sprintf("[cc-connect sender_id=%s sender_name=\"%s\" platform=%s chat_id=%s]%s\n%s", userID, safeName, platform, chatID, guard, content)
 	}
-	return fmt.Sprintf("[cc-connect sender_id=%s platform=%s chat_id=%s]\n%s", userID, platform, chatID, content)
+	return fmt.Sprintf("[cc-connect sender_id=%s platform=%s chat_id=%s]%s\n%s", userID, platform, chatID, guard, content)
 }
 
 func extractChannelID(sessionKey string) string {

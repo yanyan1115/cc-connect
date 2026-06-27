@@ -53,6 +53,24 @@ func TestOpencodeSessionEntry_Unmarshal(t *testing.T) {
 	if e.Created != 1774172652782 {
 		t.Errorf("Created = %d, want %d", e.Created, 1774172652782)
 	}
+	if e.Directory != "/path/to/project" {
+		t.Errorf("Directory = %q, want /path/to/project", e.Directory)
+	}
+}
+
+func TestOpencodeSessionMatchesWorkDir(t *testing.T) {
+	workDir := t.TempDir()
+	otherDir := t.TempDir()
+
+	if !opencodeSessionMatchesWorkDir(workDir, workDir) {
+		t.Fatal("matching workdir should be included")
+	}
+	if opencodeSessionMatchesWorkDir(otherDir, workDir) {
+		t.Fatal("different workdir should be excluded")
+	}
+	if !opencodeSessionMatchesWorkDir("", workDir) {
+		t.Fatal("missing directory should preserve legacy inclusion")
+	}
 }
 
 // TestNewOpencodeSession_ContinueSessionTreatedAsFresh verifies that

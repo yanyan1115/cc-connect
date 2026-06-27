@@ -82,10 +82,12 @@ type stubTelegramBot struct {
 	setMyCommandsCalls   int
 	getFileCalls         int
 	setReactionCalls     int
+	lastReactionEmoji    string
 
 	sendErr    error
 	getFileErr error
 	file       *models.File
+	fileURL    string
 }
 
 func newStubTelegramBot() *stubTelegramBot {
@@ -191,25 +193,40 @@ func (b *stubTelegramBot) SetMyCommands(_ context.Context, _ *tgbot.SetMyCommand
 	return true, nil
 }
 
-func (b *stubTelegramBot) GetFile(_ context.Context, _ *tgbot.GetFileParams) (*models.File, error) {
+func (b *stubTelegramBot) GetFile(_ context.Context, params *tgbot.GetFileParams) (*models.File, error) {
 	b.mu.Lock()
 	b.getFileCalls++
 	b.mu.Unlock()
 	if b.getFileErr != nil {
 		return nil, b.getFileErr
 	}
+	if params != nil && params.FileID != "" {
+		return &models.File{FilePath: params.FileID}, nil
+	}
 	return b.file, nil
 }
 
 func (b *stubTelegramBot) FileDownloadLink(f *models.File) string {
+	if b.fileURL != "" {
+		return b.fileURL + "/" + f.FilePath
+	}
 	return "https://test.example.com/file/" + f.FilePath
 }
 
-func (b *stubTelegramBot) SetMessageReaction(_ context.Context, _ *tgbot.SetMessageReactionParams) (bool, error) {
+func (b *stubTelegramBot) SetMessageReaction(_ context.Context, params *tgbot.SetMessageReactionParams) (bool, error) {
 	b.mu.Lock()
 	b.setReactionCalls++
+	if params != nil && len(params.Reaction) > 0 && params.Reaction[0].ReactionTypeEmoji != nil {
+		b.lastReactionEmoji = params.Reaction[0].ReactionTypeEmoji.Emoji
+	}
 	b.mu.Unlock()
 	return true, nil
+}
+
+func (b *stubTelegramBot) LastReactionEmoji() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastReactionEmoji
 }
 
 func (b *stubTelegramBot) SendMessageCallCount() int {
@@ -768,7 +785,7 @@ func TestReconstructReplyCtx(t *testing.T) {
 }
 
 func TestIsDirectedAtBot(t *testing.T) {
-	p := &Platform{token: "token", httpClient: &http.Client{}}
+	p := &Platform{token: "token", httpClient: &http.Client{}, wakeWords: "South,南南"}
 	p.selfUser = &models.User{ID: 42, Username: "mybot"}
 
 	tests := []struct {
@@ -821,6 +838,30 @@ func TestIsDirectedAtBot(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "South wake word in text",
+			msg: &models.Message{
+				Text: "South 来一下",
+				Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup},
+			},
+			want: true,
+		},
+		{
+			name: "Chinese wake word in text",
+			msg: &models.Message{
+				Text: "南南来一下",
+				Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup},
+			},
+			want: true,
+		},
+		{
+			name: "South wake word in caption",
+			msg: &models.Message{
+				Caption: "south 看看这张图",
+				Chat:    models.Chat{ID: 1, Type: models.ChatTypeGroup},
+			},
+			want: true,
+		},
+		{
 			name: "reply to bot message",
 			msg: &models.Message{
 				Text: "yes do it",
@@ -838,6 +879,98 @@ func TestIsDirectedAtBot(t *testing.T) {
 				Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup},
 			},
 			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := p.isDirectedAtBot(tt.msg)
+			if got != tt.want {
+				t.Fatalf("isDirectedAtBot() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsDirectedAtBotUsesConfiguredWakeWords(t *testing.T) {
+	p := &Platform{token: "token", httpClient: &http.Client{}, wakeWords: "DeepSeek,Helper"}
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	tests := []struct {
+		name string
+		msg  *models.Message
+		want bool
+	}{
+		{
+			name: "configured Chinese wake word",
+			msg:  &models.Message{Text: "Helper ping", Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup}},
+			want: true,
+		},
+		{
+			name: "configured model name",
+			msg:  &models.Message{Caption: "DeepSeek 看看图", Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup}},
+			want: true,
+		},
+		{
+			name: "unconfigured English alias",
+			msg:  &models.Message{Text: "dteacher ping", Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup}},
+			want: false,
+		},
+		{
+			name: "unconfigured South wake word",
+			msg:  &models.Message{Text: "South ping", Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup}},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := p.isDirectedAtBot(tt.msg)
+			if got != tt.want {
+				t.Fatalf("isDirectedAtBot() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsDirectedAtBotCanDisableWakeWords(t *testing.T) {
+	p := &Platform{token: "token", httpClient: &http.Client{}, wakeWords: ""}
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	tests := []struct {
+		name string
+		msg  *models.Message
+		want bool
+	}{
+		{
+			name: "bare configured name disabled",
+			msg:  &models.Message{Text: "Helper ping", Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup}},
+			want: false,
+		},
+		{
+			name: "default South disabled by explicit empty config",
+			msg:  &models.Message{Text: "South ping", Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup}},
+			want: false,
+		},
+		{
+			name: "mention still works",
+			msg: &models.Message{
+				Text: "hey @mybot ping",
+				Chat: models.Chat{ID: 1, Type: models.ChatTypeGroup},
+				Entities: []models.MessageEntity{
+					{Type: models.MessageEntityTypeMention, Offset: 4, Length: 6},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "reply to bot still works",
+			msg: &models.Message{
+				Text:           "ping",
+				Chat:           models.Chat{ID: 1, Type: models.ChatTypeGroup},
+				ReplyToMessage: &models.Message{From: &models.User{ID: 42}},
+			},
+			want: true,
 		},
 	}
 
@@ -935,6 +1068,644 @@ func TestHandleMessagePrivateTopicUsesThreadID(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("message not handled")
+	}
+}
+
+func TestHandleMessageMediaGroupMergesPhotosAndCaption(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "data:%s", strings.TrimPrefix(r.URL.Path, "/"))
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		token:              "token",
+		httpClient:         server.Client(),
+		groupReplyAll:      true,
+		mediaGroupDebounce: 5 * time.Millisecond,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	now := int(time.Now().Unix())
+	p.handleMessage(context.Background(), &models.Message{
+		ID:           12,
+		MediaGroupID: "album-1",
+		Date:         now,
+		From:         &models.User{ID: 7, Username: "alice"},
+		Chat:         models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Photo:        []models.PhotoSize{{FileID: "small"}, {FileID: "photo-b"}},
+	})
+	p.handleMessage(context.Background(), &models.Message{
+		ID:           11,
+		MediaGroupID: "album-1",
+		Caption:      "look @mybot",
+		Date:         now,
+		From:         &models.User{ID: 7, Username: "alice"},
+		Chat:         models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Photo:        []models.PhotoSize{{FileID: "photo-a"}},
+	})
+
+	select {
+	case got := <-handled:
+		if got.Content != "look" {
+			t.Fatalf("Content = %q, want %q", got.Content, "look")
+		}
+		if len(got.Images) != 2 {
+			t.Fatalf("Images len = %d, want 2", len(got.Images))
+		}
+		if string(got.Images[0].Data) != "data:photo-a" || string(got.Images[1].Data) != "data:photo-b" {
+			t.Fatalf("image data = %q, %q; want ordered photo-a/photo-b", got.Images[0].Data, got.Images[1].Data)
+		}
+		if got.SessionKey != "telegram:100:7" {
+			t.Fatalf("SessionKey = %q, want telegram:100:7", got.SessionKey)
+		}
+		rc := got.ReplyCtx.(replyContext)
+		if rc.messageID != 11 {
+			t.Fatalf("reply messageID = %d, want caption message 11", rc.messageID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("merged media group not handled")
+	}
+
+	select {
+	case extra := <-handled:
+		t.Fatalf("unexpected extra dispatch: %+v", extra)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestHandleMessageSinglePhotoDispatchesImmediately(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "single-photo")
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		token:              "token",
+		httpClient:         server.Client(),
+		groupReplyAll:      true,
+		mediaGroupDebounce: time.Hour,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:      21,
+		Date:    int(time.Now().Unix()),
+		From:    &models.User{ID: 7, Username: "alice"},
+		Chat:    models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Caption: "one",
+		Photo:   []models.PhotoSize{{FileID: "photo-one"}},
+	})
+
+	select {
+	case got := <-handled:
+		if got.Content != "one" {
+			t.Fatalf("Content = %q, want one", got.Content)
+		}
+		if len(got.Images) != 1 {
+			t.Fatalf("Images len = %d, want 1", len(got.Images))
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("single photo was delayed")
+	}
+}
+
+func TestHandleMessageStickerDispatchesMCPTextOnly(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		groupReplyAll: true,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   22,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Sticker: &models.Sticker{
+			FileID:       "sticker-file-id",
+			FileUniqueID: "sticker-unique-id",
+			Emoji:        "\U0001f608",
+		},
+	})
+
+	select {
+	case got := <-handled:
+		if !strings.Contains(got.Content, "[Telegram sticker]") {
+			t.Fatalf("Content = %q, want sticker marker", got.Content)
+		}
+		if !strings.Contains(got.Content, "emoji: \U0001f608") {
+			t.Fatalf("Content = %q, want emoji", got.Content)
+		}
+		if !strings.Contains(got.Content, "file_id: sticker-file-id") {
+			t.Fatalf("Content = %q, want file_id", got.Content)
+		}
+		if strings.Contains(got.Content, "sticker-unique-id") {
+			t.Fatalf("Content = %q, must not contain file_unique_id", got.Content)
+		}
+		if !strings.Contains(got.Content, "download_sticker(file_id, emoji)") {
+			t.Fatalf("Content = %q, want MCP tool hint", got.Content)
+		}
+		if len(got.Images) != 0 {
+			t.Fatalf("Images len = %d, want 0", len(got.Images))
+		}
+		if len(got.Files) != 0 {
+			t.Fatalf("Files len = %d, want 0", len(got.Files))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sticker message not handled")
+	}
+
+	if calls := stubBot.GetFileCallCount(); calls != 0 {
+		t.Fatalf("GetFile calls = %d, want 0", calls)
+	}
+}
+
+func TestHandleMessageStickerWithoutEmojiDispatchesFileID(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		groupReplyAll: true,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   23,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Sticker: &models.Sticker{
+			FileID: "sticker-file-id",
+		},
+	})
+
+	select {
+	case got := <-handled:
+		if !strings.Contains(got.Content, "[Telegram sticker]") {
+			t.Fatalf("Content = %q, want sticker marker", got.Content)
+		}
+		if !strings.Contains(got.Content, "emoji: \n") {
+			t.Fatalf("Content = %q, want empty emoji field", got.Content)
+		}
+		if !strings.Contains(got.Content, "file_id: sticker-file-id") {
+			t.Fatalf("Content = %q, want file_id", got.Content)
+		}
+		if len(got.Images) != 0 {
+			t.Fatalf("Images len = %d, want 0", len(got.Images))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("sticker message not handled")
+	}
+}
+
+func TestHandleMessageGroupStickerRequiresDirection(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		groupReplyAll: false,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   24,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypeGroup, Title: "group"},
+		Sticker: &models.Sticker{
+			FileID: "sticker-file-id",
+			Emoji:  "\U0001f608",
+		},
+	})
+
+	select {
+	case got := <-handled:
+		t.Fatalf("unexpected sticker dispatch without direction: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestHandleMessageGroupRequiresAllowedChat(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		allowChat:     "-100",
+		groupReplyAll: true,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+	now := int(time.Now().Unix())
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   29,
+		Date: now,
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: -200, Type: models.ChatTypeGroup, Title: "blocked"},
+		Text: "hello from blocked group",
+	})
+
+	select {
+	case got := <-handled:
+		t.Fatalf("unexpected dispatch for unauthorized chat: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   30,
+		Date: now,
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: -100, Type: models.ChatTypeGroup, Title: "allowed"},
+		Text: "hello from allowed group",
+	})
+
+	select {
+	case got := <-handled:
+		if got.Content != "hello from allowed group" {
+			t.Fatalf("Content = %q, want allowed message", got.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("allowed group message not handled")
+	}
+}
+
+func TestHandleMessageAllowedGroupAllowsAnySender(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		allowFrom:     "1",
+		allowChat:     "-100",
+		groupReplyAll: false,
+		wakeWords:     "South,南南",
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   31,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: -100, Type: models.ChatTypeGroup, Title: "allowed"},
+		Text: "South are you there?",
+	})
+
+	select {
+	case got := <-handled:
+		if got.UserID != "7" {
+			t.Fatalf("UserID = %q, want sender user", got.UserID)
+		}
+		if got.Content != "South are you there?" {
+			t.Fatalf("Content = %q, want directed group message", got.Content)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("allowed group sender was not handled")
+	}
+}
+
+func TestHandleMessageDirectedReplyUsesRepliedMessageAsReplyTarget(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		allowChat:     "-100",
+		groupReplyAll: false,
+		wakeWords:     "South,南南",
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   40,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: -100, Type: models.ChatTypeGroup, Title: "allowed"},
+		Text: "South reply to this",
+		ReplyToMessage: &models.Message{
+			ID:   39,
+			From: &models.User{ID: 8, Username: "bob"},
+			Chat: models.Chat{ID: -100, Type: models.ChatTypeGroup, Title: "allowed"},
+			Text: "question from bob",
+		},
+	})
+
+	select {
+	case got := <-handled:
+		rc := got.ReplyCtx.(replyContext)
+		if rc.messageID != 39 {
+			t.Fatalf("reply messageID = %d, want replied-to message", rc.messageID)
+		}
+		if !got.SuppressQueueAck {
+			t.Fatal("SuppressQueueAck = false, want true for group messages")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("directed group reply was not handled")
+	}
+}
+
+func TestHandleMessagePrivateRequiresAllowedSender(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:      "token",
+		httpClient: &http.Client{},
+		allowFrom:  "1",
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   32,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 7, Type: models.ChatTypePrivate},
+		Text: "hello",
+	})
+
+	select {
+	case got := <-handled:
+		t.Fatalf("unexpected private dispatch for unauthorized sender: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+func TestHandleMessageUsesConfiguredReactionEmoji(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:           "token",
+		httpClient:      &http.Client{},
+		enableReactions: true,
+		reactionEmoji:   "🐾",
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   31,
+		Date: int(time.Now().Unix()),
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypePrivate},
+		Text: "hello",
+	})
+
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("message not handled")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if got := stubBot.LastReactionEmoji(); got != "" {
+			if got != "🐾" {
+				t.Fatalf("reaction emoji = %q, want 🐾", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("reaction was not sent")
+}
+
+func TestChooseReactionEmojiAuto(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *models.Message
+		want string
+	}{
+		{name: "question", msg: &models.Message{Text: "哥哥看看这个？"}, want: "👀"},
+		{name: "success", msg: &models.Message{Text: "好耶搞定啦"}, want: "🎉"},
+		{name: "sad", msg: &models.Message{Text: "QAQ 呜呜"}, want: "🥺"},
+		{name: "laugh", msg: &models.Message{Text: "哈哈哈哈"}, want: "😁"},
+		{name: "sticker", msg: &models.Message{Sticker: &models.Sticker{FileID: "s"}}, want: "🐾"},
+		{name: "photo", msg: &models.Message{Photo: []models.PhotoSize{{FileID: "p"}}}, want: "👀"},
+		{name: "default", msg: &models.Message{Text: "hello"}, want: "🐾"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := chooseReactionEmoji(tt.msg); got != tt.want {
+				t.Fatalf("chooseReactionEmoji() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestHandleMessageDirectedGroupIncludesRecentContext(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		groupReplyAll: false,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	p.bot = newStubTelegramBot()
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+	now := int(time.Now().Unix())
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   30,
+		Date: now,
+		From: &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypeGroup, Title: "group"},
+		Text: "we were talking about memory cache",
+	})
+
+	select {
+	case got := <-handled:
+		t.Fatalf("unexpected dispatch for plain group message: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	p.handleMessage(context.Background(), &models.Message{
+		ID:   31,
+		Date: now,
+		From: &models.User{ID: 8, Username: "cora"},
+		Chat: models.Chat{ID: 100, Type: models.ChatTypeGroup, Title: "group"},
+		Text: "@mybot what did we discuss?",
+		Entities: []models.MessageEntity{
+			{Type: models.MessageEntityTypeMention, Offset: 0, Length: 6},
+		},
+	})
+
+	select {
+	case got := <-handled:
+		if got.Content != "what did we discuss?" {
+			t.Fatalf("Content = %q, want mention stripped", got.Content)
+		}
+		if !strings.Contains(got.ExtraContent, "[Recent group context") {
+			t.Fatalf("ExtraContent missing context header: %q", got.ExtraContent)
+		}
+		if !strings.Contains(got.ExtraContent, "do not imitate the group's style") {
+			t.Fatalf("ExtraContent missing style guard: %q", got.ExtraContent)
+		}
+		if !strings.Contains(got.ExtraContent, "@alice: we were talking about memory cache") {
+			t.Fatalf("ExtraContent missing previous group message: %q", got.ExtraContent)
+		}
+		if strings.Contains(got.ExtraContent, "@cora") {
+			t.Fatalf("ExtraContent should not include current directed message: %q", got.ExtraContent)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("directed group message not handled")
+	}
+}
+
+func TestHandleMessageMediaGroupsDoNotMix(t *testing.T) {
+	handled := make(chan *core.Message, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "data:%s", strings.TrimPrefix(r.URL.Path, "/"))
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		token:              "token",
+		httpClient:         server.Client(),
+		groupReplyAll:      true,
+		mediaGroupDebounce: 5 * time.Millisecond,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	now := int(time.Now().Unix())
+	for _, item := range []struct {
+		id      int
+		groupID string
+		fileID  string
+		caption string
+	}{
+		{id: 31, groupID: "album-a", fileID: "a", caption: "A"},
+		{id: 32, groupID: "album-b", fileID: "b", caption: "B"},
+	} {
+		p.handleMessage(context.Background(), &models.Message{
+			ID:           item.id,
+			MediaGroupID: item.groupID,
+			Caption:      item.caption,
+			Date:         now,
+			From:         &models.User{ID: 7, Username: "alice"},
+			Chat:         models.Chat{ID: 100, Type: models.ChatTypePrivate},
+			Photo:        []models.PhotoSize{{FileID: item.fileID}},
+		})
+	}
+
+	got := map[string]*core.Message{}
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-handled:
+			got[msg.Content] = msg
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for media groups")
+		}
+	}
+	if len(got["A"].Images) != 1 || string(got["A"].Images[0].Data) != "data:a" {
+		t.Fatalf("album A was mixed or missing: %+v", got["A"])
+	}
+	if len(got["B"].Images) != 1 || string(got["B"].Images[0].Data) != "data:b" {
+		t.Fatalf("album B was mixed or missing: %+v", got["B"])
+	}
+}
+
+func TestHandleMessageGroupMediaGroupDirectedByCaption(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "data:%s", strings.TrimPrefix(r.URL.Path, "/"))
+	}))
+	defer server.Close()
+
+	p := &Platform{
+		token:              "token",
+		httpClient:         server.Client(),
+		groupReplyAll:      false,
+		mediaGroupDebounce: 5 * time.Millisecond,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	now := int(time.Now().Unix())
+	p.handleMessage(context.Background(), &models.Message{
+		ID:           41,
+		MediaGroupID: "album-group",
+		Date:         now,
+		From:         &models.User{ID: 7, Username: "alice"},
+		Chat:         models.Chat{ID: 100, Type: models.ChatTypeGroup, Title: "group"},
+		Photo:        []models.PhotoSize{{FileID: "first"}},
+	})
+	p.handleMessage(context.Background(), &models.Message{
+		ID:           42,
+		MediaGroupID: "album-group",
+		Caption:      "please inspect @mybot",
+		CaptionEntities: []models.MessageEntity{
+			{Type: models.MessageEntityTypeMention, Offset: 15, Length: 6},
+		},
+		Date:  now,
+		From:  &models.User{ID: 7, Username: "alice"},
+		Chat:  models.Chat{ID: 100, Type: models.ChatTypeGroup, Title: "group"},
+		Photo: []models.PhotoSize{{FileID: "second"}},
+	})
+
+	select {
+	case got := <-handled:
+		if got.Content != "please inspect" {
+			t.Fatalf("Content = %q, want caption without bot mention", got.Content)
+		}
+		if len(got.Images) != 2 {
+			t.Fatalf("Images len = %d, want 2", len(got.Images))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("directed group media group not handled")
 	}
 }
 

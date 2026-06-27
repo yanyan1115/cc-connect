@@ -1,0 +1,25 @@
+[Unit]
+Description=cc-connect OpenCode Telegram runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/cc-connect-opencode/workspace/Assistant
+EnvironmentFile=/etc/cc-connect-opencode/env
+Environment=PATH=/root/.opencode/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CC_LOG_FILE=/var/log/cc-connect-opencode/cc-connect.log
+Environment=CC_LOG_MAX_SIZE=20
+StateDirectory=cc-connect-opencode
+LogsDirectory=cc-connect-opencode
+ExecStart=/bin/sh -c 'test -n "$TELEGRAM_BOT_TOKEN" || exit 78; test -n "$TELEGRAM_ALLOW_FROM" || exit 78; test -n "$OPENCODE_MODEL" || exit 78; exec /opt/cc-connect-opencode/bin/cc-connect -config /etc/cc-connect-opencode/config.toml'
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

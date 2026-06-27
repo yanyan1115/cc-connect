@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -107,9 +108,12 @@ type botFactory func(token string, onUpdate func(context.Context, *models.Update
 type Platform struct {
 	token                 string
 	allowFrom             string
+	allowChat             string
 	groupReplyAll         bool
 	shareSessionInChannel bool
 	enableReactions       bool
+	reactionEmoji         string
+	wakeWords             string
 	httpClient            *http.Client
 
 	mu                  sync.RWMutex
@@ -125,13 +129,46 @@ type Platform struct {
 	newBot              botFactory
 	newBackoffTimer     func(time.Duration) backoffTimer
 	newTypingTicker     func(time.Duration) typingTicker
+
+	mediaGroupMu       sync.Mutex
+	mediaGroups        map[string]*telegramMediaGroup
+	mediaGroupDebounce time.Duration
+
+	groupContextMu sync.Mutex
+	groupContext   map[string][]groupContextEntry
 }
 
 const (
 	initialReconnectBackoff = time.Second
 	maxReconnectBackoff     = 30 * time.Second
 	stableConnectionWindow  = 10 * time.Second
+	mediaGroupDebounce      = 900 * time.Millisecond
+	groupContextMaxMessages = 20
+	groupContextMaxChars    = 3000
 )
+
+type telegramMessageContext struct {
+	sessionKey string
+	userID     string
+	userName   string
+	chatName   string
+	channelKey string
+	replyCtx   replyContext
+	isGroup    bool
+}
+
+type groupContextEntry struct {
+	messageID int
+	sender    string
+	text      string
+}
+
+type telegramMediaGroup struct {
+	ctx      telegramMessageContext
+	messages []*models.Message
+	timer    *time.Timer
+	seq      uint64
+}
 
 func New(opts map[string]any) (core.Platform, error) {
 	token, _ := opts["token"].(string)
@@ -140,6 +177,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 	allowFrom, _ := opts["allow_from"].(string)
 	core.CheckAllowFrom("telegram", allowFrom)
+	allowChat, _ := opts["allow_chat"].(string)
 
 	// Build HTTP client with optional proxy support.
 	// Timeout must exceed the server-side long-poll duration (pollTimeout − 1s = 59s)
@@ -162,7 +200,15 @@ func New(opts map[string]any) (core.Platform, error) {
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
 	enableReactions, _ := opts["enable_reactions"].(bool)
-	return &Platform{token: token, allowFrom: allowFrom, groupReplyAll: groupReplyAll, shareSessionInChannel: shareSessionInChannel, enableReactions: enableReactions, httpClient: httpClient}, nil
+	reactionEmoji, _ := opts["reaction_emoji"].(string)
+	if reactionEmoji == "" {
+		reactionEmoji = "⚡"
+	}
+	wakeWords, hasWakeWords := opts["wake_words"].(string)
+	if !hasWakeWords {
+		wakeWords = "South,南南"
+	}
+	return &Platform{token: token, allowFrom: allowFrom, allowChat: allowChat, groupReplyAll: groupReplyAll, shareSessionInChannel: shareSessionInChannel, enableReactions: enableReactions, reactionEmoji: reactionEmoji, wakeWords: wakeWords, httpClient: httpClient}, nil
 }
 
 func (p *Platform) Name() string { return "telegram" }
@@ -341,6 +387,10 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 	// MessageThreadID, but using it would split an existing session each time
 	// a user replies to a specific message — so we ignore it there.
 	isGroup := msg.Chat.Type == models.ChatTypeGroup || msg.Chat.Type == models.ChatTypeSupergroup
+	if isGroup && !core.AllowList(p.allowChat, strconv.FormatInt(msg.Chat.ID, 10)) {
+		slog.Debug("telegram: message from unauthorized chat", "chat", msg.Chat.ID)
+		return
+	}
 	threadID := 0
 	if msg.Chat.IsForum || !isGroup {
 		threadID = msg.MessageThreadID
@@ -349,7 +399,7 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 	channelKey := buildChannelKey(msg.Chat.ID, threadID)
 
 	userID := strconv.FormatInt(msg.From.ID, 10)
-	if !core.AllowList(p.allowFrom, userID) {
+	if !isGroup && !core.AllowList(p.allowFrom, userID) {
 		slog.Debug("telegram: message from unauthorized user", "user", userID)
 		return
 	}
@@ -359,6 +409,24 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		chatName = msg.Chat.Title
 	}
 
+	rctx := p.replyContextForMessage(msg, threadID)
+	if p.isMediaGroupAttachment(msg) {
+		p.bufferMediaGroup(msg, telegramMessageContext{
+			sessionKey: sessionKey,
+			userID:     userID,
+			userName:   userName,
+			chatName:   chatName,
+			channelKey: channelKey,
+			replyCtx:   rctx,
+			isGroup:    isGroup,
+		})
+		return
+	}
+
+	if isGroup {
+		p.recordGroupContext(channelKey, msg)
+	}
+
 	if isGroup && !p.groupReplyAll {
 		slog.Debug("telegram: checking group message", "text", msg.Text, "is_command", isCommand(msg))
 		if !p.isDirectedAtBot(msg) {
@@ -366,11 +434,28 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		}
 	}
 
-	rctx := replyContext{chatID: msg.Chat.ID, threadID: threadID, messageID: msg.ID}
-	if p.enableReactions {
-		go p.reactToMessage(ctx, msg.Chat.ID, msg.ID, "⚡")
+	if p.enableReactions && p.reactionEmoji != "" {
+		reactionEmoji := p.reactionEmoji
+		if strings.EqualFold(reactionEmoji, "auto") {
+			reactionEmoji = chooseReactionEmoji(msg)
+		}
+		if reactionEmoji != "" {
+			go p.reactToMessage(ctx, msg.Chat.ID, msg.ID, reactionEmoji)
+		}
 	}
 	botName := p.botUsername()
+
+	if msg.Sticker != nil {
+		p.dispatchMessage(&core.Message{
+			SessionKey: sessionKey, Platform: "telegram",
+			UserID: userID, UserName: userName, ChatName: chatName,
+			Content:    formatStickerMCPContent(msg.Sticker),
+			MessageID:  strconv.Itoa(msg.ID),
+			ChannelKey: channelKey,
+			ReplyCtx:   rctx,
+		}, msg)
+		return
+	}
 
 	if len(msg.Photo) > 0 {
 		best := msg.Photo[len(msg.Photo)-1]
@@ -500,9 +585,156 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 	}, msg)
 }
 
+func (p *Platform) isMediaGroupAttachment(msg *models.Message) bool {
+	return msg.MediaGroupID != "" && (len(msg.Photo) > 0 || msg.Document != nil)
+}
+
+func (p *Platform) bufferMediaGroup(msg *models.Message, msgCtx telegramMessageContext) {
+	key := fmt.Sprintf("%s:%s:%s", msgCtx.channelKey, msgCtx.userID, msg.MediaGroupID)
+	delay := p.mediaGroupDelay()
+
+	p.mediaGroupMu.Lock()
+	defer p.mediaGroupMu.Unlock()
+
+	if p.mediaGroups == nil {
+		p.mediaGroups = make(map[string]*telegramMediaGroup)
+	}
+	group := p.mediaGroups[key]
+	if group == nil {
+		group = &telegramMediaGroup{ctx: msgCtx}
+		p.mediaGroups[key] = group
+	}
+	group.messages = append(group.messages, msg)
+	group.seq++
+	seq := group.seq
+	if group.timer != nil {
+		group.timer.Stop()
+	}
+	group.timer = time.AfterFunc(delay, func() {
+		p.flushMediaGroup(key, seq)
+	})
+}
+
+func (p *Platform) mediaGroupDelay() time.Duration {
+	if p.mediaGroupDebounce > 0 {
+		return p.mediaGroupDebounce
+	}
+	return mediaGroupDebounce
+}
+
+func (p *Platform) flushMediaGroup(key string, seq uint64) {
+	p.mediaGroupMu.Lock()
+	group := p.mediaGroups[key]
+	if group == nil || group.seq != seq {
+		p.mediaGroupMu.Unlock()
+		return
+	}
+	delete(p.mediaGroups, key)
+	p.mediaGroupMu.Unlock()
+
+	if p.isStopping() {
+		return
+	}
+	p.dispatchMediaGroup(group)
+}
+
+func (p *Platform) stopMediaGroups() {
+	p.mediaGroupMu.Lock()
+	defer p.mediaGroupMu.Unlock()
+	for key, group := range p.mediaGroups {
+		if group.timer != nil {
+			group.timer.Stop()
+		}
+		delete(p.mediaGroups, key)
+	}
+}
+
+func (p *Platform) dispatchMediaGroup(group *telegramMediaGroup) {
+	if group == nil || len(group.messages) == 0 {
+		return
+	}
+	sort.SliceStable(group.messages, func(i, j int) bool {
+		return group.messages[i].ID < group.messages[j].ID
+	})
+
+	if group.ctx.isGroup && !p.groupReplyAll {
+		directed := false
+		for _, msg := range group.messages {
+			if p.isDirectedAtBot(msg) {
+				directed = true
+				break
+			}
+		}
+		if !directed {
+			return
+		}
+	}
+
+	botName := p.botUsername()
+	var captions []string
+	var images []core.ImageAttachment
+	var files []core.FileAttachment
+	replyCtx := group.ctx.replyCtx
+	dispatchTGMsg := group.messages[0]
+
+	for _, msg := range group.messages {
+		if caption := stripBotMention(msg.Caption, botName); caption != "" {
+			captions = append(captions, caption)
+			replyCtx.messageID = msg.ID
+			dispatchTGMsg = msg
+		}
+		if len(msg.Photo) > 0 {
+			best := msg.Photo[len(msg.Photo)-1]
+			imgData, err := p.downloadFile(best.FileID)
+			if err != nil {
+				slog.Error("telegram: download media group photo failed", "error", err)
+				continue
+			}
+			images = append(images, core.ImageAttachment{MimeType: "image/jpeg", Data: imgData})
+			continue
+		}
+		if msg.Document != nil {
+			slog.Info("telegram: media group document received", "user", group.ctx.userName, "file_name", msg.Document.FileName, "mime", msg.Document.MimeType)
+			fileData, err := p.downloadFile(msg.Document.FileID)
+			if err != nil {
+				slog.Error("telegram: download media group document failed", "error", err)
+				continue
+			}
+			files = append(files, core.FileAttachment{MimeType: msg.Document.MimeType, Data: fileData, FileName: msg.Document.FileName})
+		}
+	}
+
+	content := strings.Join(captions, "\n")
+	if content == "" && len(images) == 0 && len(files) == 0 {
+		return
+	}
+	p.dispatchMessage(&core.Message{
+		SessionKey: group.ctx.sessionKey,
+		Platform:   "telegram",
+		UserID:     group.ctx.userID,
+		UserName:   group.ctx.userName,
+		ChatName:   group.ctx.chatName,
+		Content:    content,
+		MessageID:  strconv.Itoa(group.messages[0].ID),
+		ChannelKey: group.ctx.channelKey,
+		Images:     images,
+		Files:      files,
+		ReplyCtx:   replyCtx,
+	}, dispatchTGMsg)
+}
+
 func (p *Platform) dispatchMessage(msg *core.Message, tgMsg *models.Message) {
+	if msg != nil && tgMsg != nil && (tgMsg.Chat.Type == models.ChatTypeGroup || tgMsg.Chat.Type == models.ChatTypeSupergroup) {
+		msg.SuppressQueueAck = true
+	}
+
 	// Enrich with platform-specific context (reply quotes, location text, etc.)
 	var extras []string
+	if msg != nil && tgMsg != nil && msg.ChannelKey != "" && (tgMsg.Chat.Type == models.ChatTypeGroup || tgMsg.Chat.Type == models.ChatTypeSupergroup) {
+		if groupText := p.groupContextText(msg.ChannelKey, tgMsg.ID); groupText != "" {
+			extras = append(extras, groupText)
+		}
+	}
 	if replyText := enrichReplyContent(tgMsg); replyText != "" {
 		extras = append(extras, replyText)
 	}
@@ -518,6 +750,97 @@ func (p *Platform) dispatchMessage(msg *core.Message, tgMsg *models.Message) {
 		return
 	}
 	handler(p, msg)
+}
+
+func (p *Platform) replyContextForMessage(msg *models.Message, threadID int) replyContext {
+	if msg == nil {
+		return replyContext{threadID: threadID}
+	}
+	rctx := replyContext{chatID: msg.Chat.ID, threadID: threadID, messageID: msg.ID}
+	if msg.ReplyToMessage == nil {
+		return rctx
+	}
+	if msg.Chat.Type != models.ChatTypeGroup && msg.Chat.Type != models.ChatTypeSupergroup {
+		return rctx
+	}
+	if !p.isDirectedAtBot(msg) {
+		return rctx
+	}
+	return replyContext{chatID: msg.Chat.ID, threadID: threadID, messageID: msg.ReplyToMessage.ID}
+}
+
+func (p *Platform) recordGroupContext(channelKey string, msg *models.Message) {
+	if channelKey == "" || msg == nil || msg.From == nil {
+		return
+	}
+	text := strings.TrimSpace(msg.Text)
+	if text == "" {
+		text = strings.TrimSpace(msg.Caption)
+	}
+	if text == "" {
+		return
+	}
+
+	sender := msg.From.Username
+	if sender != "" {
+		sender = "@" + sender
+	} else {
+		sender = strings.TrimSpace(msg.From.FirstName + " " + msg.From.LastName)
+	}
+	if sender == "" {
+		sender = strconv.FormatInt(msg.From.ID, 10)
+	}
+
+	p.groupContextMu.Lock()
+	defer p.groupContextMu.Unlock()
+	if p.groupContext == nil {
+		p.groupContext = make(map[string][]groupContextEntry)
+	}
+	entries := append(p.groupContext[channelKey], groupContextEntry{messageID: msg.ID, sender: sender, text: text})
+	if len(entries) > groupContextMaxMessages {
+		entries = entries[len(entries)-groupContextMaxMessages:]
+	}
+	p.groupContext[channelKey] = entries
+}
+
+func (p *Platform) groupContextText(channelKey string, currentMessageID int) string {
+	p.groupContextMu.Lock()
+	entries := append([]groupContextEntry(nil), p.groupContext[channelKey]...)
+	p.groupContextMu.Unlock()
+	if len(entries) == 0 {
+		return ""
+	}
+
+	lines := make([]string, 0, len(entries))
+	total := 0
+	for i := len(entries) - 1; i >= 0; i-- {
+		entry := entries[i]
+		if entry.messageID == currentMessageID {
+			continue
+		}
+		line := strings.TrimSpace(fmt.Sprintf("%s: %s", entry.sender, entry.text))
+		if line == ":" {
+			continue
+		}
+		lineLen := utf8.RuneCountInString(line)
+		if len(lines) > 0 && total+lineLen+1 > groupContextMaxChars {
+			break
+		}
+		if len(lines) == 0 && lineLen > groupContextMaxChars {
+			runes := []rune(line)
+			line = string(runes[len(runes)-groupContextMaxChars:])
+			lineLen = groupContextMaxChars
+		}
+		lines = append(lines, line)
+		total += lineLen + 1
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+	return "[Recent group context - use for context only; do not imitate the group's style, keep the South persona.]\n" + strings.Join(lines, "\n")
 }
 
 func (p *Platform) messageHandler() core.MessageHandler {
@@ -542,6 +865,29 @@ func (p *Platform) reactToMessage(ctx context.Context, chatID int64, messageID i
 		}},
 	}); err != nil {
 		slog.Debug("telegram: set reaction failed", "error", err)
+	}
+}
+
+func chooseReactionEmoji(msg *models.Message) string {
+	if msg == nil {
+		return "🐾"
+	}
+	text := strings.ToLower(strings.TrimSpace(msg.Text + " " + msg.Caption))
+	switch {
+	case strings.Contains(text, "?") || strings.Contains(text, "？") || strings.Contains(text, "👀"):
+		return "👀"
+	case strings.Contains(text, "好耶") || strings.Contains(text, "成功") || strings.Contains(text, "搞定") || strings.Contains(text, "🎉"):
+		return "🎉"
+	case strings.Contains(text, "呜") || strings.Contains(text, "qaq") || strings.Contains(text, "🥺") || strings.Contains(text, "😭"):
+		return "🥺"
+	case strings.Contains(text, "哈哈") || strings.Contains(text, "笑"):
+		return "😁"
+	case msg.Sticker != nil:
+		return "🐾"
+	case len(msg.Photo) > 0:
+		return "👀"
+	default:
+		return "🐾"
 	}
 }
 
@@ -571,6 +917,18 @@ func stripBotMention(text, botName string) string {
 	}
 	text = strings.ReplaceAll(text, "@"+botName, "")
 	return strings.TrimSpace(text)
+}
+
+func formatStickerMCPContent(sticker *models.Sticker) string {
+	if sticker == nil {
+		return "[Telegram sticker]\nemoji: \nfile_id: \nUse the sticker MCP tool download_sticker(file_id, emoji) to view it as an image."
+	}
+
+	return fmt.Sprintf(
+		"[Telegram sticker]\nemoji: %s\nfile_id: %s\nUse the sticker MCP tool download_sticker(file_id, emoji) to view it as an image.",
+		strings.TrimSpace(sticker.Emoji),
+		strings.TrimSpace(sticker.FileID),
+	)
 }
 
 func (p *Platform) getNewBot() botFactory {
@@ -726,6 +1084,10 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 	}
 
 	isGroupChat := msg.Chat.Type == models.ChatTypeGroup || msg.Chat.Type == models.ChatTypeSupergroup
+	if isGroupChat && !core.AllowList(p.allowChat, strconv.FormatInt(chatID, 10)) {
+		slog.Debug("telegram: callback from unauthorized chat", "chat", chatID)
+		return
+	}
 	threadID := 0
 	if msg.Chat.IsForum || !isGroupChat {
 		threadID = msg.MessageThreadID
@@ -870,7 +1232,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 //   - Command with @thisbot suffix (e.g. /help@thisbot)
 //   - Command without @suffix (broadcast to all bots — accept it)
 //   - Command with @otherbot suffix → reject
-//   - Non-command: accept if bot is @mentioned or message is a reply to bot
+//   - Non-command: accept if bot is @mentioned, called by name, or message is a reply to bot
 func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 	p.mu.RLock()
 	self := p.selfUser
@@ -910,6 +1272,9 @@ func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 			}
 		}
 	}
+	if p.containsWakeWord(msg.Text) {
+		return true
+	}
 
 	// Check if replying to a message from this bot
 	if msg.ReplyToMessage != nil && msg.ReplyToMessage.From != nil {
@@ -930,8 +1295,30 @@ func (p *Platform) isDirectedAtBot(msg *models.Message) bool {
 			}
 		}
 	}
+	if p.containsWakeWord(msg.Caption) {
+		return true
+	}
 
 	slog.Debug("telegram: ignoring group message not directed at bot", "chat", msg.Chat.ID, "bot", botName, "text", msg.Text, "entities", msg.Entities)
+	return false
+}
+
+func (p *Platform) containsWakeWord(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	wakeWords := p.wakeWords
+	lowerText := strings.ToLower(text)
+	for _, word := range strings.Split(wakeWords, ",") {
+		word = strings.TrimSpace(word)
+		if word == "" {
+			continue
+		}
+		if strings.Contains(lowerText, strings.ToLower(word)) {
+			return true
+		}
+	}
 	return false
 }
 
@@ -1476,6 +1863,7 @@ func (p *Platform) Stop() error {
 	if cancel != nil {
 		cancel()
 	}
+	p.stopMediaGroups()
 	return nil
 }
 
